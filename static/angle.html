@@ -17,21 +17,21 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.04.1779672342"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.06.04.1779672342"></script>
-    <script src="/static/js/theme.js?v=2026.06.04.1780456238"></script>
-    <script src="/static/js/i18n.js?v=2026.06.04.1780481181"></script>
-    <script src="/static/js/image-preview.js?v=2026.06.04.1779672341"></script>
-    <script src="/static/js/history-bulk-manager.js?v=2026.06.04.1780450958"></script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/theme.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/i18n.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/image-preview.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/history-bulk-manager.js?v=2026.06.05-image2-strict-provider"></script>
     <script type="importmap">
         {
             "imports": {
-                "three": "/static/vendor/js/three-0.160.0.module.js?v=2026.06.04"
+                "three": "/static/vendor/js/three-0.160.0.module.js?v=2026.06.05-image2-strict-provider"
             }
         }
     </script>
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.06.04.1779672342');
+        @import url('/static/vendor/css/fonts.css?v=2026.06.05-image2-strict-provider');
 
         :root {
             --accent: #111827;
@@ -274,7 +274,7 @@
             border-color: #0f141d;
         }
     </style>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.04.1779672341">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.05-image2-strict-provider">
 </head>
 
 <body class="selection:bg-black selection:text-white">
@@ -953,25 +953,27 @@
         async function runCloudTask() {
             if (!uploadedFile) throw new Error("Please upload an image first");
 
-            // Get token from centralized management (Global server token first, legacy localStorage fallback)
+            // Prefer the server-managed key; legacy localStorage is only a fallback.
             let token = '';
+            let serverTokenAvailable = false;
             try {
                 const res = await fetch('/api/config/token');
                 if (res.ok) {
                     const data = await res.json();
+                    serverTokenAvailable = data.has_token === true || Boolean(data.token);
                     if (data.token) token = data.token;
                 }
             } catch (e) {
                 console.warn("Failed to fetch global token", e);
             }
-            if (token) {
+            if (serverTokenAvailable) {
                 // 自愈：清掉可能过期的旧版本地 Token，避免覆盖服务端有效 Token
                 try { localStorage.removeItem('modelscope_api_token'); } catch (e) { }
             } else {
                 token = localStorage.getItem('modelscope_api_token') || '';
             }
 
-            if (!token) {
+            if (!serverTokenAvailable && !token) {
                 if (window.parent && typeof window.parent.openTokenModal === 'function') {
                     window.parent.openTokenModal();
                     // Allow the error to propagate so user sees the message

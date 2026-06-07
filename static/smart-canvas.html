@@ -16,10 +16,10 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/lucide.js?v=2026.06.04.1779672342"></script>
-    <script src="/static/js/theme.js?v=2026.06.04.1780456238"></script>
-    <script src="/static/js/i18n.js?v=2026.06.04.1780481181"></script>
-    <link rel="stylesheet" href="/static/css/smart-canvas.css?v=2026.06.04.1780649209">
+    <script src="/static/vendor/js/lucide.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/theme.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/i18n.js?v=2026.06.05-image2-strict-provider"></script>
+    <link rel="stylesheet" href="/static/css/smart-canvas.css?v=2026.06.05-image2-strict-provider">
 </head>
 <body>
     <div id="shell" class="shell">
@@ -142,7 +142,10 @@
                 <button class="asset-tab" type="button" data-asset-tab="workflow" data-i18n="smart.assetWorkflows">工作流</button>
             </div>
             <div id="assetImageControls">
-                <select id="assetLibrarySelect" class="asset-category-select asset-library-select" title="选择资产库"></select>
+                <div class="asset-library-row">
+                    <select id="assetLibrarySelect" class="asset-category-select asset-library-select" title="选择资产库"></select>
+                    <button id="assetAddLibraryBtn" class="asset-mini-btn" type="button" title="新建资产库"><i data-lucide="library-big"></i></button>
+                </div>
                 <div class="asset-category-row">
                     <select id="assetCategorySelect" class="asset-category-select"></select>
                     <button id="assetAddCategoryBtn" class="asset-mini-btn" type="button" title="新建文件夹" data-i18n-title="smart.assetNewFolder"><i data-lucide="folder-plus"></i></button>
@@ -346,6 +349,6 @@
         <div id="toast" class="toast"></div>
         <div id="mentionPreview" class="mention-preview"><img alt="preview"></div>
     </div>
-    <script src="/static/js/smart-canvas.js?v=2026.06.04.1780649199"></script>
+    <script src="/static/js/smart-canvas.js?v=2026.06.05-image2-strict-provider"></script>
 </body>
 </html>

@@ -29,7 +29,7 @@ from threading import Lock, Thread
 import httpx
 from PIL import Image
 from io import BytesIO
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
@@ -159,7 +159,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.06.03"
+APP_VERSION = "2026.06.05-image2-strict-provider"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -1281,19 +1281,7 @@ def versioned_static_html(html: str) -> str:
         return html
     safe_version = urllib.parse.quote(version, safe="._-")
     pattern = re.compile(r'(?P<prefix>(?:src|href)=["\']|@import\s+url\(["\'])(?P<url>/static/[^"\')?#]+(?:\.(?:js|css|html)))(?:\?v=[^"\')#]*)?', re.I)
-    def replace(match):
-        url = match.group("url")
-        cache_version = safe_version
-        try:
-            rel = urllib.parse.unquote(url[len("/static/"):]).replace("/", os.sep)
-            path = os.path.abspath(os.path.join(STATIC_DIR, rel))
-            static_root = os.path.abspath(STATIC_DIR)
-            if path.startswith(static_root + os.sep) and os.path.isfile(path):
-                cache_version = f"{safe_version}.{int(os.path.getmtime(path))}"
-        except Exception:
-            pass
-        return f"{match.group('prefix')}{url}?v={cache_version}"
-    return pattern.sub(replace, html)
+    return pattern.sub(lambda m: f"{m.group('prefix')}{m.group('url')}?v={safe_version}", html)
 
 def sync_static_html_versions():
     version = current_app_version()
@@ -1315,7 +1303,7 @@ def sync_static_html_versions():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     old = f.read()
-                new = versioned_static_html(re.sub(r'([?&]v=)[^"\'`\s<>)]*', rf'\g<1>{safe_version}', old))
+                new = re.sub(r'([?&]v=)[^"\'`\s<>)]*', rf'\g<1>{safe_version}', old)
                 if new != old:
                     with open(path, "w", encoding="utf-8", newline="") as f:
                         f.write(new)
@@ -2160,6 +2148,26 @@ class OnlineImageRequest(BaseModel):
 
 CANVAS_TASKS: Dict[str, Dict[str, Any]] = {}
 CANVAS_TASK_LOCK = Lock()
+try:
+    CANVAS_IMAGE_TASK_CONCURRENCY = max(1, min(64, int(os.getenv("CANVAS_IMAGE_TASK_CONCURRENCY", "24") or "24")))
+except Exception:
+    CANVAS_IMAGE_TASK_CONCURRENCY = 24
+try:
+    CANVAS_IMAGE_PROVIDER_CONCURRENCY = max(1, min(16, int(os.getenv("CANVAS_IMAGE_PROVIDER_CONCURRENCY", "8") or "8")))
+except Exception:
+    CANVAS_IMAGE_PROVIDER_CONCURRENCY = 8
+CANVAS_IMAGE_TASK_SEMAPHORE = asyncio.Semaphore(CANVAS_IMAGE_TASK_CONCURRENCY)
+CANVAS_IMAGE_PROVIDER_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
+CANVAS_IMAGE_PROVIDER_SEMAPHORE_LOCK = Lock()
+
+def canvas_image_provider_semaphore(provider_id: str):
+    key = str(provider_id or "default").strip() or "default"
+    with CANVAS_IMAGE_PROVIDER_SEMAPHORE_LOCK:
+        sem = CANVAS_IMAGE_PROVIDER_SEMAPHORES.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(CANVAS_IMAGE_PROVIDER_CONCURRENCY)
+            CANVAS_IMAGE_PROVIDER_SEMAPHORES[key] = sem
+        return sem
 
 class CanvasVideoRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=VIDEO_PROMPT_MAX_LENGTH)
@@ -2327,6 +2335,30 @@ class CanvasSaveRequest(BaseModel):
     client_id: str = ""
     base_updated_at: int = 0
 
+class CanvasAgentCommand(BaseModel):
+    action: str = ""
+    prompt: str = ""
+    image_node_ids: List[str] = Field(default_factory=list)
+    images: List[Any] = Field(default_factory=list)
+    image_urls: List[str] = Field(default_factory=list)
+    targets: List[Any] = Field(default_factory=list)
+    providers: List[str] = Field(default_factory=list)
+    models: List[str] = Field(default_factory=list)
+    title: str = ""
+    mode: str = "reference_edit"
+    generator_id: str = ""
+    provider_id: str = ""
+    model: str = ""
+    count: int = 1
+    ratio: str = "source"
+    resolution: str = "1k"
+    quality: str = "auto"
+    group_images: bool = False
+    compare_providers: bool = False
+    x: float = 0
+    y: float = 0
+    run: bool = False
+
 class CanvasAssetCheckRequest(BaseModel):
     urls: List[str] = []
 
@@ -2334,15 +2366,6 @@ class CanvasAssetDownloadRequest(BaseModel):
     urls: List[str] = []
     items: List[Dict[str, Any]] = []
     filename: str = "canvas-output-images.zip"
-
-class CanvasWorkflowExportRequest(BaseModel):
-    nodes: List[Dict[str, Any]] = []
-    connections: List[Dict[str, Any]] = []
-    filename: str = "canvas-workflow.zip"
-    include_resources: bool = True
-    library_id: str = ""
-    category_id: str = ""
-    name: str = ""
 
 class SmartCanvasGroupExportItem(BaseModel):
     kind: str = ""
@@ -2358,22 +2381,6 @@ class SmartCanvasGroupExportRequest(BaseModel):
 class LocalImageImportRequest(BaseModel):
     path: str = ""
     paths: List[str] = Field(default_factory=list)
-
-class LocalAssetCaptionRequest(BaseModel):
-    names: List[str] = []
-    provider: str = "comfly"
-    model: str = ""
-    ms_model: str = ""
-    prompt: str = "描述图片"
-
-class LocalAssetCaptionSaveRequest(BaseModel):
-    name: str = ""
-    caption: str = ""
-
-class LocalAssetFolderRequest(BaseModel):
-    parent: str = ""
-    path: str = ""
-    name: str = ""
 
 class AssetLibraryCategoryRequest(BaseModel):
     name: str = "新文件夹"
@@ -2406,7 +2413,6 @@ class SharedFolderImport(BaseModel):
 
 class AssetLibraryRenameRequest(BaseModel):
     name: str = ""
-    library_id: str = ""
 
 class AssetLibraryBatchDeleteRequest(BaseModel):
     ids: List[str] = []
@@ -2877,6 +2883,885 @@ def list_deleted_canvases():
     records = iter_canvas_records(include_deleted=True)
     return sorted(records, key=lambda item: item["deleted_at"], reverse=True)
 
+def agent_uid(prefix="agent"):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}_{now_ms()}"
+
+def agent_canvas_snapshot(canvas):
+    nodes = canvas.get("nodes") or []
+    connections = canvas.get("connections") or []
+    logs = canvas.get("logs") or []
+    image_nodes = [
+        {
+            "id": node.get("id"),
+            "name": node.get("name") or "",
+            "url": node.get("url") or "",
+            "x": node.get("x", 0),
+            "y": node.get("y", 0),
+        }
+        for node in nodes
+        if node.get("type") == "image" and node.get("url")
+    ]
+    generators = [
+        {
+            "id": node.get("id"),
+            "type": node.get("type"),
+            "provider": node.get("apiProvider") or node.get("llmProvider") or "",
+            "model": node.get("model") or "",
+            "runStatus": node.get("runStatus") or "",
+            "runError": node.get("runError") or "",
+            "inputs": node.get("inputs") or [],
+        }
+        for node in nodes
+        if node.get("type") in {"generator", "msgen", "comfy", "ltxDirector", "video", "rh", "llm"}
+    ]
+    output_nodes = [
+        {
+            "id": node.get("id"),
+            "x": node.get("x", 0),
+            "y": node.get("y", 0),
+            "image_count": len([item for item in (node.get("images") or []) if item]),
+        }
+        for node in nodes
+        if node.get("type") == "output"
+    ]
+    failed_logs = [
+        {
+            "createdAt": item.get("createdAt"),
+            "nodeType": item.get("nodeType") or "",
+            "model": item.get("model") or "",
+            "error": item.get("error") or "",
+        }
+        for item in logs
+        if item.get("status") == "failed"
+    ][:20]
+    return {
+        "id": canvas.get("id"),
+        "title": canvas.get("title"),
+        "kind": normalize_canvas_kind(canvas.get("kind")),
+        "updated_at": canvas.get("updated_at", 0),
+        "node_count": len(nodes),
+        "connection_count": len(connections),
+        "image_nodes": image_nodes,
+        "generators": generators,
+        "output_nodes": output_nodes,
+        "recent_failed_logs": failed_logs,
+    }
+
+def agent_preferred_image_provider(provider_id=""):
+    providers = [p for p in load_api_providers() if p.get("enabled", True)]
+    if provider_id:
+        found = next((p for p in providers if p.get("id") == provider_id), None)
+        if found:
+            return found
+    with_nano = next(
+        (p for p in providers if any("nano-banana" in str(m).lower() for m in p.get("image_models") or [])),
+        None,
+    )
+    if with_nano:
+        return with_nano
+    return next((p for p in providers if p.get("image_models")), None) or {}
+
+def agent_preferred_image_model(provider, requested=""):
+    models = [str(m) for m in (provider or {}).get("image_models") or [] if str(m).strip()]
+    if requested and requested in models:
+        return requested
+    nano = next((m for m in models if "nano-banana-pro" in m.lower()), None)
+    if nano:
+        return nano
+    nano = next((m for m in models if "nano-banana" in m.lower()), None)
+    if nano:
+        return nano
+    return requested or (models[0] if models else "nano-banana-pro")
+
+def agent_connect(connections, from_id, to_id):
+    if not from_id or not to_id:
+        return
+    if any(c.get("from") == from_id and c.get("to") == to_id for c in connections):
+        return
+    connections.append({"id": agent_uid("c"), "from": from_id, "to": to_id})
+
+def _node_has_codex_submap_result(node):
+    if not isinstance(node, dict):
+        return False
+    protected_sources = {"codex-submap-run", "codex-restore", "codex-history-restore"}
+    if node.get("restoredBy") in protected_sources or node.get("source") in protected_sources:
+        return True
+    result_lists = []
+    if node.get("type") == "generator":
+        result_lists.append(node.get("generatedOutputs") or [])
+    if node.get("type") == "output":
+        result_lists.append(node.get("images") or [])
+    return any(
+        isinstance(item, dict) and item.get("source") in protected_sources and item.get("url")
+        for items in result_lists
+        for item in (items if isinstance(items, list) else [])
+    )
+
+def merge_protected_canvas_agent_results(server_canvas, incoming_nodes, incoming_connections):
+    """Preserve completed Codex/agent submap workflows from stale browser saves."""
+    server_nodes = server_canvas.get("nodes") or []
+    server_by_id = {n.get("id"): n for n in server_nodes if isinstance(n, dict) and n.get("id")}
+    protected_ids = set()
+    protected_pairs = set()
+    for node in server_nodes:
+        if not _node_has_codex_submap_result(node):
+            continue
+        node_id = node.get("id")
+        if not node_id:
+            continue
+        protected_ids.add(node_id)
+        for conn in server_canvas.get("connections") or []:
+            if not isinstance(conn, dict):
+                continue
+            if conn.get("from") == node_id:
+                protected_ids.add(conn.get("to"))
+                protected_pairs.add((conn.get("from"), conn.get("to")))
+            if conn.get("to") == node_id:
+                protected_ids.add(conn.get("from"))
+                protected_pairs.add((conn.get("from"), conn.get("to")))
+    if not protected_ids:
+        return incoming_nodes, incoming_connections
+    protected_ids = {node_id for node_id in protected_ids if node_id}
+    merged_nodes = []
+    seen = set()
+    for node in incoming_nodes or []:
+        node_id = node.get("id") if isinstance(node, dict) else ""
+        if node_id in protected_ids and node_id in server_by_id:
+            merged_nodes.append(server_by_id[node_id])
+        else:
+            merged_nodes.append(node)
+        if node_id:
+            seen.add(node_id)
+    for node_id in protected_ids:
+        if node_id in server_by_id and node_id not in seen:
+            merged_nodes.append(server_by_id[node_id])
+            seen.add(node_id)
+
+    merged_connections = list(incoming_connections or [])
+    existing_pairs = {
+        (c.get("from"), c.get("to"))
+        for c in merged_connections
+        if isinstance(c, dict)
+    }
+    for conn in server_canvas.get("connections") or []:
+        if not isinstance(conn, dict):
+            continue
+        pair = (conn.get("from"), conn.get("to"))
+        if pair in protected_pairs and pair not in existing_pairs:
+            merged_connections.append(conn)
+            existing_pairs.add(pair)
+    return merged_nodes, merged_connections
+
+def agent_clean_text(value, limit=12000):
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return ""
+    return text[:max(1, int(limit or 12000))]
+
+def agent_media_url(value):
+    text = str(value or "").strip()
+    if text.startswith(("http://", "https://", "/output/", "/assets/", "data:image/")):
+        return text
+    return ""
+
+def agent_provider_match(provider, value):
+    target = str(value or "").strip().lower()
+    if not target:
+        return False
+    fields = [
+        provider.get("id"),
+        provider.get("name"),
+        provider.get("base_url"),
+    ]
+    fields.extend(provider.get("aliases") or [])
+    for field in fields:
+        text = str(field or "").strip().lower()
+        if text and (text == target or target in {part.strip() for part in re.split(r"[,/|;]+", text) if part.strip()}):
+            return True
+    return False
+
+def agent_image_providers_by_values(values):
+    providers = [p for p in load_api_providers() if p.get("enabled", True) and (p.get("image_models") or [])]
+    providers = sorted(providers, key=lambda p: 0 if p.get("primary") else 1)
+    requested = [str(item or "").strip() for item in (values or []) if str(item or "").strip()]
+    if not requested:
+        keyed = [p for p in providers if provider_has_usable_key(p)]
+        return keyed or providers
+    selected = []
+    missing = []
+    for value in requested:
+        found = next((p for p in providers if agent_provider_match(p, value)), None)
+        if found:
+            if found.get("id") not in {p.get("id") for p in selected}:
+                selected.append(found)
+        else:
+            missing.append(value)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"未找到可生图 API 平台：{', '.join(missing)}")
+    return selected
+
+def agent_board_model_for_provider(provider, requested="", model_values=None, index=0):
+    models = [str(item or "").strip() for item in ((provider or {}).get("image_models") or []) if str(item or "").strip()]
+    requested = str(requested or "").strip()
+    if not requested and model_values:
+        candidates = [str(item or "").strip() for item in model_values if str(item or "").strip()]
+        requested = candidates[index % len(candidates)] if candidates else ""
+    if requested and (not models or requested in models):
+        return requested
+    if requested:
+        loose = next((m for m in models if m.lower() == requested.lower()), "")
+        if loose:
+            return loose
+        return requested
+    gpt2 = next((m for m in models if is_gpt_image_2_model(m)), "")
+    if gpt2:
+        return gpt2
+    return agent_preferred_image_model(provider, "")
+
+def agent_board_origin(nodes, payload):
+    if payload.x or payload.y:
+        return float(payload.x or 0), float(payload.y or 0)
+    max_right = 0
+    for node in nodes or []:
+        try:
+            x = float(node.get("x") or 0)
+            w = float(node.get("w") or 300)
+            max_right = max(max_right, x + w)
+        except Exception:
+            continue
+    return max(120.0, max_right + 160.0), 120.0
+
+def agent_reference_images_from_nodes(image_nodes):
+    refs = []
+    for node in image_nodes or []:
+        url = agent_media_url(node.get("url"))
+        if not url:
+            continue
+        refs.append({
+            "url": url,
+            "name": node.get("name") or "reference.png",
+            "role": node.get("role") or "",
+            "kind": "image",
+        })
+    return refs
+
+def agent_generation_size(ratio="source", resolution="1k"):
+    ratio_text = str(ratio or "").strip().lower()
+    res_text = str(resolution or "").strip().lower()
+    if ratio_text in {"", "source", "auto"}:
+        ratio_text = "square"
+    ratio_key = agent_canvas_ratio_value(ratio_text)
+    size_map = {
+        "square": {"1k": "1024x1024", "2k": "2048x2048", "4k": "4096x4096"},
+        "portrait": {"1k": "1024x1536", "2k": "1360x2048", "4k": "2352x3520"},
+        "portrait43": {"1k": "1008x1344", "2k": "1536x2048", "4k": "2448x3264"},
+        "landscape43": {"1k": "1344x1008", "2k": "2048x1536", "4k": "3264x2448"},
+        "landscape": {"1k": "1536x1024", "2k": "2048x1360", "4k": "3520x2352"},
+        "story": {"1k": "720x1280", "2k": "1152x2048", "4k": "2160x3840"},
+        "wide": {"1k": "1280x720", "2k": "2048x1152", "4k": "3840x2160"},
+        "ultrawide": {"1k": "1280x544", "2k": "2048x880", "4k": "3840x1648"},
+        "ultratall": {"1k": "544x1280", "2k": "880x2048", "4k": "1648x3840"},
+    }
+    if ratio_key in size_map:
+        return size_map[ratio_key].get(res_text) or size_map[ratio_key]["1k"]
+    long_edge = {"1k": 1536, "2k": 2048, "4k": 3840}.get(res_text, 1536)
+    match = re.fullmatch(r"\s*(\d+)\s*:\s*(\d+)\s*", ratio_text)
+    if not match:
+        return "1024x1024"
+    rw, rh = max(1, int(match.group(1))), max(1, int(match.group(2)))
+    if rw >= rh:
+        width = long_edge
+        height = max(256, int(long_edge * rh / rw))
+    else:
+        height = long_edge
+        width = max(256, int(long_edge * rw / rh))
+    width = max(256, int(width // 16) * 16)
+    height = max(256, int(height // 16) * 16)
+    return f"{width}x{height}"
+
+def agent_reference_image_dimensions(url):
+    text = str(url or "").strip()
+    try:
+        if text.startswith("data:image/"):
+            _, encoded = text.split(",", 1)
+            with Image.open(BytesIO(base64.b64decode(encoded))) as img:
+                return img.size
+        if text.startswith(("/output/", "/assets/")):
+            path = output_file_from_url(text)
+            if path:
+                with Image.open(path) as img:
+                    return img.size
+    except Exception:
+        return None
+    return None
+
+def agent_ratio_label_from_dimensions(width, height):
+    ratio = max(1, float(width or 1)) / max(1, float(height or 1))
+    choices = [
+        (1, 1, "1:1"),
+        (3, 2, "3:2"),
+        (2, 3, "2:3"),
+        (4, 3, "4:3"),
+        (3, 4, "3:4"),
+        (16, 9, "16:9"),
+        (9, 16, "9:16"),
+        (21, 9, "21:9"),
+        (9, 21, "9:21"),
+    ]
+    return min(choices, key=lambda item: abs(ratio - item[0] / item[1]))[2]
+
+def agent_generation_size_for_refs(ratio="source", resolution="1k", refs=None):
+    ratio_text = str(ratio or "").strip().lower()
+    if ratio_text in {"", "source", "auto"}:
+        for ref in refs or []:
+            dims = agent_reference_image_dimensions(ref.get("url") if isinstance(ref, dict) else "")
+            if dims:
+                ratio_text = agent_ratio_label_from_dimensions(dims[0], dims[1])
+                break
+    return agent_generation_size(ratio_text or ratio, resolution)
+
+def agent_canvas_ratio_value(ratio="source"):
+    value = str(ratio or "").strip().lower().replace(" ", "")
+    mapping = {
+        "": "source",
+        "auto": "source",
+        "source": "source",
+        "square": "square",
+        "1:1": "square",
+        "4:3": "landscape43",
+        "landscape43": "landscape43",
+        "3:4": "portrait43",
+        "portrait43": "portrait43",
+        "3:2": "landscape",
+        "landscape": "landscape",
+        "2:3": "portrait",
+        "portrait": "portrait",
+        "16:9": "wide",
+        "wide": "wide",
+        "9:16": "story",
+        "story": "story",
+        "21:9": "ultrawide",
+        "ultrawide": "ultrawide",
+        "9:21": "ultratall",
+        "ultratall": "ultratall",
+        "custom": "custom",
+    }
+    return mapping.get(value, value or "source")
+
+def agent_prompt_for_mode(mode, prompt, target_title=""):
+    text = agent_clean_text(prompt, ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    if text:
+        return text
+    mode_text = str(mode or "").strip().lower()
+    if mode_text in {"ui_night", "night_ui", "night", "dark_ui"}:
+        return (
+            "将参考 UI 图片转换为黑夜深色版本。严格保持原图布局、组件层级、图标位置、尺寸关系和信息结构；"
+            "把背景、卡片、导航、弹窗和控件改为高级深色视觉，保留品牌识别和可读性；"
+            "不要改变页面内容，不要新增无关元素，不要输出文字说明。"
+        )
+    if mode_text in {"recreate", "replicate", "match_target"}:
+        label = f"目标：{target_title}。" if target_title else ""
+        return (
+            f"{label}根据参考图复刻同一套图片的结构、视角、主体比例、材质、光影和风格。"
+            "保持画面干净、高清、低噪点、无水印；结构一致但不要照搬低清瑕疵。"
+        )
+    return (
+        "根据参考图和用户需求生成图片。保持主体结构、构图关系、风格一致性和细节完整，"
+        "输出高清、干净、无水印的结果。"
+    )
+
+def agent_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y", "是"}
+
+def agent_normalize_targets(payload: CanvasAgentCommand):
+    raw_targets = payload.targets or []
+    if not raw_targets:
+        return [{
+            "title": payload.title or "任务 1",
+            "prompt": agent_prompt_for_mode(payload.mode, payload.prompt, payload.title),
+            "providers": payload.providers or ([payload.provider_id] if payload.provider_id else []),
+            "model": payload.model,
+            "count": payload.count,
+            "ratio": payload.ratio,
+            "resolution": payload.resolution,
+            "quality": payload.quality,
+            "compare_providers": payload.compare_providers,
+        }]
+    targets = []
+    for index, item in enumerate(raw_targets[:40]):
+        if isinstance(item, str):
+            title = f"任务 {index + 1}"
+            prompt = item
+            extra = {}
+        elif isinstance(item, dict):
+            title = agent_clean_text(item.get("title") or item.get("name") or f"任务 {index + 1}", 80)
+            prompt = item.get("prompt") or item.get("text") or payload.prompt
+            extra = item
+        else:
+            continue
+        targets.append({
+            "title": title or f"任务 {index + 1}",
+            "prompt": agent_prompt_for_mode(payload.mode, prompt, title),
+            "providers": extra.get("providers") or extra.get("provider_ids") or payload.providers or ([payload.provider_id] if payload.provider_id else []),
+            "model": extra.get("model") or payload.model,
+            "count": extra.get("count") or payload.count,
+            "ratio": extra.get("ratio") or extra.get("aspect_ratio") or extra.get("aspectRatio") or "source",
+            "resolution": extra.get("resolution") or payload.resolution,
+            "quality": extra.get("quality") or payload.quality,
+            "group_images": extra.get("group_images") or extra.get("multi_ref") or extra.get("multiReference") or False,
+            "compare_providers": extra.get("compare_providers") or extra.get("parallel_providers") or extra.get("provider_compare") or payload.compare_providers,
+            "image_indexes": extra.get("image_indexes") or extra.get("image_indices") or extra.get("image_index") or extra.get("imageIndex") or [],
+            "image_ids": extra.get("image_ids") or extra.get("image_node_ids") or extra.get("imageId") or extra.get("image_id") or [],
+        })
+    return targets or agent_normalize_targets(CanvasAgentCommand(
+        action=payload.action,
+        prompt=payload.prompt,
+        provider_id=payload.provider_id,
+        model=payload.model,
+        count=payload.count,
+        ratio=payload.ratio,
+        resolution=payload.resolution,
+        quality=payload.quality,
+        compare_providers=payload.compare_providers,
+        title=payload.title,
+        mode=payload.mode,
+    ))
+
+def agent_source_image_nodes(canvas, payload: CanvasAgentCommand, origin_x, origin_y):
+    nodes = canvas.setdefault("nodes", [])
+    requested_ids = [str(item or "").strip() for item in (payload.image_node_ids or []) if str(item or "").strip()]
+    image_nodes = [
+        node for node in nodes
+        if node.get("type") == "image" and node.get("url") and (not requested_ids or node.get("id") in requested_ids)
+    ]
+    if not requested_ids:
+        image_nodes = []
+    raw_images = []
+    raw_images.extend(payload.images or [])
+    raw_images.extend([{"url": url} for url in (payload.image_urls or [])])
+    created = []
+    for index, item in enumerate(raw_images[:80]):
+        if isinstance(item, str):
+            url = agent_media_url(item)
+            name = f"reference-{index + 1}.png"
+            role = ""
+        elif isinstance(item, dict):
+            url = agent_media_url(item.get("url") or item.get("src") or item.get("path"))
+            name = agent_clean_text(item.get("name") or item.get("title") or f"reference-{index + 1}.png", 80)
+            role = agent_clean_text(item.get("role") or "", 80)
+        else:
+            continue
+        if not url:
+            continue
+        if any(node.get("url") == url for node in image_nodes + created):
+            continue
+        tile_w = 240
+        tile_h = 290
+        col = index % 2
+        row = index // 2
+        created.append({
+            "id": agent_uid("img"),
+            "type": "image",
+            "x": origin_x + 36 + col * tile_w,
+            "y": origin_y + 92 + row * tile_h,
+            "url": url,
+            "name": name,
+            "role": role,
+        })
+    nodes.extend(created)
+    return image_nodes + created, created
+
+def agent_compose_input_group_metrics(image_count):
+    prompt_w = 360
+    prompt_h = 260
+    image_cols = min(2, max(0, int(image_count or 0)))
+    image_rows = (max(0, int(image_count or 0)) + 1) // 2
+    image_area_w = 36 + image_cols * 240 if image_cols else 0
+    prompt_x_offset = image_area_w + 32 if image_cols else 36
+    group_w = max(460, prompt_x_offset + prompt_w + 36)
+    group_h = max(360, 112 + image_rows * 290, prompt_h + 132)
+    return {
+        "prompt_w": prompt_w,
+        "prompt_h": prompt_h,
+        "prompt_x_offset": prompt_x_offset,
+        "group_w": group_w,
+        "group_h": group_h,
+    }
+
+def agent_layout_compose_images(base_image_nodes, nodes, group_x, group_y, used_image_ids=None):
+    used_image_ids = used_image_ids if used_image_ids is not None else set()
+    row_images = []
+    for index, source in enumerate(base_image_nodes or []):
+        col = index % 2
+        row = index // 2
+        x = group_x + 36 + col * 240
+        y = group_y + 92 + row * 290
+        source_id = source.get("id")
+        if source_id not in used_image_ids:
+            source["x"] = x
+            source["y"] = y
+            used_image_ids.add(source_id)
+            row_images.append(source)
+            continue
+        clone = {
+            "id": agent_uid("img"),
+            "type": "image",
+            "x": x,
+            "y": y,
+            "url": source.get("url"),
+            "name": source.get("name") or f"reference-{index + 1}.png",
+            "role": source.get("role") or "",
+        }
+        for key in ("mediaKind", "originalLocalUrl"):
+            if source.get(key):
+                clone[key] = source.get(key)
+        nodes.append(clone)
+        row_images.append(clone)
+    return row_images
+
+def agent_list_value(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+def agent_target_explicit_image_nodes(target, image_nodes):
+    selected = []
+    seen = set()
+
+    def add_node(node):
+        if not node or node.get("id") in seen:
+            return
+        selected.append(node)
+        seen.add(node.get("id"))
+
+    for raw in agent_list_value(target.get("image_indexes")):
+        try:
+            index = int(raw)
+        except Exception:
+            continue
+        if 1 <= index <= len(image_nodes):
+            add_node(image_nodes[index - 1])
+        elif 0 <= index < len(image_nodes):
+            add_node(image_nodes[index])
+
+    requested_ids = {str(item or "").strip() for item in agent_list_value(target.get("image_ids")) if str(item or "").strip()}
+    if requested_ids:
+        for node in image_nodes:
+            if node.get("id") in requested_ids:
+                add_node(node)
+
+    return selected
+
+def agent_targets_with_image_sets(targets, image_nodes, payload: CanvasAgentCommand):
+    if not image_nodes:
+        return [(target, []) for target in targets]
+    if agent_bool(getattr(payload, "group_images", False)):
+        return [(target, image_nodes) for target in targets]
+
+    result = []
+    has_explicit = False
+    for target in targets:
+        explicit_nodes = agent_target_explicit_image_nodes(target, image_nodes)
+        if explicit_nodes or agent_bool(target.get("group_images")):
+            has_explicit = True
+            result.append((target, explicit_nodes or image_nodes))
+        else:
+            result.append((target, None))
+    if has_explicit:
+        return [(target, nodes_for_target or [image_nodes[min(index, len(image_nodes) - 1)]]) for index, (target, nodes_for_target) in enumerate(result)]
+
+    if len(targets) == 1 and len(image_nodes) > 1:
+        base = targets[0]
+        expanded = []
+        for index, image_node in enumerate(image_nodes):
+            target = dict(base)
+            image_name = agent_clean_text(image_node.get("name") or f"参考图 {index + 1}", 80)
+            base_title = agent_clean_text(base.get("title") or "任务", 80)
+            target["title"] = f"{base_title} - {image_name}" if image_name and image_name not in base_title else base_title
+            expanded.append((target, [image_node]))
+        return expanded
+
+    return [(target, [image_nodes[min(index, len(image_nodes) - 1)]]) for index, target in enumerate(targets)]
+
+def agent_compose_generation_board(canvas, payload: CanvasAgentCommand):
+    nodes = canvas.setdefault("nodes", [])
+    connections = canvas.setdefault("connections", [])
+    logs = canvas.setdefault("logs", [])
+    origin_x, origin_y = agent_board_origin(nodes, payload)
+    image_nodes, created_images = agent_source_image_nodes(canvas, payload, origin_x, origin_y)
+    targets = agent_normalize_targets(payload)
+    target_entries = agent_targets_with_image_sets(targets, image_nodes, payload)
+    board_title = agent_clean_text(payload.title or canvas.get("title") or "画布自动任务", 80)
+    run_plan = []
+    prompt_ids = []
+    generator_ids = []
+    output_ids = []
+    group_ids = []
+    row_cursor_y = origin_y
+    used_image_ids = set()
+
+    for target_index, (target, target_image_nodes) in enumerate(target_entries):
+        providers = agent_image_providers_by_values(target.get("providers") or [])
+        if not providers:
+            raise HTTPException(status_code=400, detail="没有可用的生图 API 平台。")
+        if not agent_bool(target.get("compare_providers")):
+            providers = providers[:1]
+        prompt_text = agent_clean_text(target.get("prompt"), ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+        target_title = agent_clean_text(target.get("title") or f"任务 {target_index + 1}", 80)
+        count = max(1, min(8, int(target.get("count") or 1)))
+        ratio = agent_clean_text(target.get("ratio") or "source", 24)
+        canvas_ratio = agent_canvas_ratio_value(ratio)
+        resolution = agent_clean_text(target.get("resolution") or "1k", 24)
+        quality = agent_clean_text(target.get("quality") or "auto", 24)
+        metrics = agent_compose_input_group_metrics(len(target_image_nodes))
+        row_y = row_cursor_y
+        row_image_nodes = agent_layout_compose_images(target_image_nodes, nodes, origin_x, row_y, used_image_ids)
+        prompt_node = {
+            "id": agent_uid("prompt"),
+            "type": "prompt",
+            "x": origin_x + metrics["prompt_x_offset"],
+            "y": row_y + 92,
+            "text": prompt_text,
+            "w": metrics["prompt_w"],
+            "h": metrics["prompt_h"],
+            "name": target_title,
+        }
+        group_node = {
+            "id": agent_uid("grp"),
+            "type": "group",
+            "x": origin_x,
+            "y": row_y,
+            "w": metrics["group_w"],
+            "h": metrics["group_h"],
+            "items": [node.get("id") for node in row_image_nodes] + [prompt_node["id"]],
+            "name": f"{target_title} 输入",
+        }
+        nodes.append(prompt_node)
+        nodes.append(group_node)
+        prompt_ids.append(prompt_node["id"])
+        group_ids.append(group_node["id"])
+        refs = agent_reference_images_from_nodes(row_image_nodes)
+        size = agent_generation_size_for_refs(ratio, resolution, refs)
+        base_gen_x = origin_x + metrics["group_w"] + 80
+        base_out_x = base_gen_x + 460
+        for provider_index, provider in enumerate(providers):
+            provider_id = provider.get("id") or ""
+            model = agent_board_model_for_provider(provider, target.get("model"), payload.models, provider_index)
+            gen_y = row_y + 40 + provider_index * 190
+            generator_node = {
+                "id": agent_uid("gen"),
+                "type": "generator",
+                "x": base_gen_x,
+                "y": gen_y,
+                "apiProvider": provider_id,
+                "model": model,
+                "ratio": canvas_ratio,
+                "resolution": resolution,
+                "quality": quality,
+                "customRatio": "",
+                "customSize": "",
+                "customRatioWidth": "",
+                "customRatioHeight": "",
+                "customWidth": "",
+                "customHeight": "",
+                "inputs": [],
+                "count": count,
+                "apiDefaultsVersion": 2,
+                "runStatus": "",
+                "runError": "",
+                "name": f"{target_title} / {provider.get('name') or provider_id}",
+            }
+            output_node = {
+                "id": agent_uid("out"),
+                "type": "output",
+                "x": base_out_x,
+                "y": gen_y,
+                "images": [],
+                "name": f"{provider.get('name') or provider_id} 输出",
+            }
+            nodes.extend([generator_node, output_node])
+            agent_connect(connections, group_node["id"], generator_node["id"])
+            agent_connect(connections, generator_node["id"], output_node["id"])
+            generator_node["inputs"] = [
+                *[f"{group_node['id']}:{node.get('id')}" for node in row_image_nodes],
+                f"{group_node['id']}:prompts",
+            ]
+            generator_ids.append(generator_node["id"])
+            output_ids.append(output_node["id"])
+            run_plan.append({
+                "target_title": target_title,
+                "prompt": prompt_text,
+                "provider_id": provider_id,
+                "provider_name": provider.get("name") or provider_id,
+                "model": model,
+                "size": size,
+                "ratio": ratio,
+                "canvas_ratio": canvas_ratio,
+                "resolution": resolution,
+                "quality": quality,
+                "count": count,
+                "reference_images": refs,
+                "reference_count": len(refs),
+                "generator_id": generator_node["id"],
+                "output_id": output_node["id"],
+                "has_key": provider_has_usable_key(provider),
+            })
+        row_cursor_y += max(metrics["group_h"] + 120, 160 + len(providers) * 190)
+
+    canvas.setdefault("agent_logs", []).insert(0, {
+        "id": agent_uid("agentlog"),
+        "action": "compose_generation_board",
+        "created_at": now_ms(),
+        "title": board_title,
+        "mode": payload.mode,
+        "image_count": len(image_nodes),
+        "created_image_count": len(created_images),
+        "target_count": len(target_entries),
+        "generator_count": len(generator_ids),
+        "run": bool(payload.run),
+    })
+    canvas["agent_logs"] = canvas["agent_logs"][:100]
+    logs.insert(0, {
+        "id": agent_uid("log"),
+        "createdAt": now_ms(),
+        "status": "info",
+        "nodeType": "canvas-agent",
+        "model": "compose_generation_board",
+        "prompt": payload.prompt or board_title,
+        "outputs": [],
+        "error": "",
+        "platform": "canvas-agent",
+    })
+    canvas["logs"] = logs[:500]
+    return {
+        "title": board_title,
+        "mode": payload.mode,
+        "image_count": len(image_nodes),
+        "created_image_count": len(created_images),
+        "prompt_ids": prompt_ids,
+        "group_ids": group_ids,
+        "generator_ids": generator_ids,
+        "output_ids": output_ids,
+        "run_plan": run_plan,
+    }
+
+def agent_create_recreate_flow(canvas, payload: CanvasAgentCommand):
+    nodes = canvas.setdefault("nodes", [])
+    connections = canvas.setdefault("connections", [])
+    image_ids = [str(item) for item in (payload.image_node_ids or []) if str(item).strip()]
+    image_nodes = [
+        node for node in nodes
+        if node.get("type") == "image" and node.get("url") and (not image_ids or node.get("id") in image_ids)
+    ]
+    if not image_nodes:
+        raise HTTPException(status_code=400, detail="当前画布没有可用图片节点。")
+    xs = [float(node.get("x") or 0) for node in image_nodes]
+    ys = [float(node.get("y") or 0) for node in image_nodes]
+    left = min(xs) - 40
+    top = min(ys) - 80
+    width = max(760, max(xs) - min(xs) + 360)
+    height = max(360, max(ys) - min(ys) + 300)
+    provider = agent_preferred_image_provider(payload.provider_id)
+    provider_id = provider.get("id") or payload.provider_id or ""
+    model = agent_preferred_image_model(provider, payload.model)
+    prompt_text = (payload.prompt or "").strip() or (
+        "任务：使用角色参考图中的角色，复刻目标图的构图、动作、镜头和渲染风格。"
+        "保持画面整体风格统一，高清、低噪点、无水印。"
+    )
+    prompt_node = {
+        "id": agent_uid("prompt"),
+        "type": "prompt",
+        "x": left,
+        "y": top + height + 40,
+        "text": prompt_text,
+        "w": 360,
+        "h": 260,
+    }
+    group_node = {
+        "id": agent_uid("grp"),
+        "type": "group",
+        "x": left,
+        "y": top,
+        "w": width,
+        "h": height,
+        "items": [node.get("id") for node in image_nodes] + [prompt_node["id"]],
+    }
+    generator_node = {
+        "id": agent_uid("gen"),
+        "type": "generator",
+        "x": left + width + 120,
+        "y": top + 40,
+        "apiProvider": provider_id,
+        "model": model,
+        "ratio": "source",
+        "resolution": "1k",
+        "customRatio": "",
+        "customSize": "",
+        "customRatioWidth": "",
+        "customRatioHeight": "",
+        "customWidth": "",
+        "customHeight": "",
+        "inputs": [],
+        "count": 1,
+        "apiDefaultsVersion": 2,
+    }
+    output_node = {
+        "id": agent_uid("out"),
+        "type": "output",
+        "x": generator_node["x"] + 520,
+        "y": generator_node["y"],
+        "images": [],
+    }
+    nodes.extend([prompt_node, group_node, generator_node, output_node])
+    agent_connect(connections, group_node["id"], generator_node["id"])
+    agent_connect(connections, generator_node["id"], output_node["id"])
+    generator_node["inputs"] = [
+        *[f"{group_node['id']}:{node.get('id')}" for node in image_nodes],
+        f"{group_node['id']}:prompts",
+    ]
+    canvas.setdefault("agent_logs", []).insert(0, {
+        "id": agent_uid("agentlog"),
+        "action": "create_recreate_flow",
+        "created_at": now_ms(),
+        "generator_id": generator_node["id"],
+        "image_count": len(image_nodes),
+        "provider_id": provider_id,
+        "model": model,
+    })
+    canvas["agent_logs"] = canvas["agent_logs"][:100]
+    return {
+        "prompt_id": prompt_node["id"],
+        "group_id": group_node["id"],
+        "generator_id": generator_node["id"],
+        "output_id": output_node["id"],
+        "image_count": len(image_nodes),
+        "provider_id": provider_id,
+        "model": model,
+    }
+
+def agent_fix_generators(canvas, payload: CanvasAgentCommand):
+    provider = agent_preferred_image_provider(payload.provider_id)
+    provider_id = provider.get("id") or payload.provider_id or ""
+    model = agent_preferred_image_model(provider, payload.model)
+    changed = []
+    for node in canvas.get("nodes") or []:
+        if node.get("type") != "generator":
+            continue
+        target = not payload.generator_id or node.get("id") == payload.generator_id
+        error_text = f"{node.get('model') or ''} {node.get('runError') or ''}".lower()
+        if target or "gpt-image-2" in error_text or "尺寸" in error_text:
+            node["apiProvider"] = provider_id
+            node["model"] = model
+            node["resolution"] = node.get("resolution") or "1k"
+            node["runStatus"] = ""
+            node["runError"] = ""
+            changed.append(node.get("id"))
+    return {"changed": changed, "provider_id": provider_id, "model": model}
+
 def display_title(text):
     title = re.sub(r"\s+", " ", text or "").strip()
     return title[:24] or "新对话"
@@ -2909,7 +3794,7 @@ def resolve_chat_provider(provider: str, model: str, ms_model: str):
 def api_headers(json_body=True, provider=None, model=""):
     if provider:
         key_env = provider_key_env(provider["id"])
-        api_key = os.getenv(key_env, "")
+        api_key = os.getenv(key_env, "") or read_api_env_value(key_env)
         provider_name = provider.get("name") or provider["id"]
         if not api_key:
             raise HTTPException(status_code=400, detail=f"未配置 {provider_name} 的 API Key，请在 API 平台管理中填写。")
@@ -3005,6 +3890,71 @@ def text_delta_from_chat_chunk(data):
 def sse_event(data):
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+def image_from_text(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    data_match = re.search(r"(data:image/[^;\s]+;base64,[A-Za-z0-9+/=\r\n]+)", text)
+    if data_match:
+        data_url = data_match.group(1).replace("\r", "").replace("\n", "")
+        return {"type": "url", "value": data_url}
+    markdown_match = re.search(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", text)
+    if markdown_match:
+        return {"type": "url", "value": markdown_match.group(1)}
+    url_match = re.search(r"(https?://[^\s\"'<>)]*\.(?:png|jpe?g|webp|gif)(?:\?[^\s\"'<>)]*)?)", text, re.I)
+    if url_match:
+        return {"type": "url", "value": url_match.group(1)}
+    return None
+
+def extract_image_from_chat_message(message):
+    if not isinstance(message, dict):
+        return None
+    for key in ("image", "image_url", "url"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            return {"type": "url", "value": value}
+        if isinstance(value, dict):
+            url = value.get("url") or value.get("image_url")
+            if url:
+                return {"type": "url", "value": url}
+    for key in ("images", "image_urls"):
+        values = message.get(key)
+        if isinstance(values, list) and values:
+            first = values[0]
+            if isinstance(first, str) and first:
+                return {"type": "url", "value": first}
+            if isinstance(first, dict):
+                url = first.get("url") or first.get("image_url")
+                b64 = first.get("b64_json") or first.get("base64")
+                if url:
+                    return {"type": "url", "value": url}
+                if b64:
+                    return {"type": "b64", "value": b64, "mime_type": first.get("mime_type") or "image/png"}
+    content = message.get("content", "")
+    if isinstance(content, str):
+        found = image_from_text(content)
+        if found:
+            return found
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in {"image_url", "output_image", "image"}:
+                image = item.get("image_url") or item.get("image") or item
+                if isinstance(image, str) and image:
+                    return {"type": "url", "value": image}
+                if isinstance(image, dict):
+                    url = image.get("url") or image.get("image_url")
+                    b64 = image.get("b64_json") or image.get("base64")
+                    if url:
+                        return {"type": "url", "value": url}
+                    if b64:
+                        return {"type": "b64", "value": b64, "mime_type": image.get("mime_type") or "image/png"}
+            found = image_from_text(item.get("text") or item.get("content") or "")
+            if found:
+                return found
+    return None
+
 def extract_image(data):
     candidates = data.get("candidates") if isinstance(data, dict) else None
     if isinstance(candidates, list):
@@ -3028,6 +3978,14 @@ def extract_image(data):
                         "value": value,
                         "mime_type": inline.get("mimeType") or inline.get("mime_type") or "image/png",
                     }
+    if isinstance(data, dict):
+        choices = (unwrap_apimart_response(data) or {}).get("choices") or []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            found = extract_image_from_chat_message(choice.get("message") or choice.get("delta") or {})
+            if found:
+                return found
     if isinstance(data.get("data"), dict) and isinstance(data["data"].get("result"), dict):
         data = data["data"]
     if isinstance(data.get("result"), dict):
@@ -3104,6 +4062,59 @@ def effective_protocol(provider, model=""):
 def is_apimart_provider(provider):
     base_url = str((provider or {}).get("base_url") or "").lower()
     return provider_protocol(provider) == "apimart" or "apimart.ai" in base_url
+
+def provider_identity_values(provider):
+    values = [
+        str((provider or {}).get("id") or "").strip().lower(),
+        str((provider or {}).get("name") or "").strip().lower(),
+    ]
+    base_url = str((provider or {}).get("base_url") or "").strip().lower()
+    if base_url:
+        values.append(base_url)
+        try:
+            parsed = urllib.parse.urlsplit(base_url)
+            if parsed.netloc:
+                values.append(parsed.netloc.lower())
+        except Exception:
+            pass
+    return [value for value in values if value]
+
+def gpt_image_2_refs_use_generations(provider):
+    """Some OpenAI-compatible vendors expose GPT-Image-2 refs on generations, not edits."""
+    raw = str(os.getenv("GPT_IMAGE_2_REFERENCE_GENERATIONS_PROVIDERS", "tcdmx,tcdmx.com") or "").strip()
+    if not raw:
+        return False
+    wanted = [item.strip().lower() for item in re.split(r"[,;\s]+", raw) if item.strip()]
+    identities = provider_identity_values(provider)
+    return any(token in value for token in wanted for value in identities)
+
+def gpt_image_2_generation_reference_fields():
+    raw = str(os.getenv("GPT_IMAGE_2_GENERATIONS_REFERENCE_FIELDS", "image,image_urls") or "").strip()
+    allowed = {"image", "image_urls", "images", "input_image"}
+    fields = []
+    for item in re.split(r"[,;\s]+", raw):
+        field = item.strip()
+        if field in allowed and field not in fields:
+            fields.append(field)
+    return fields or ["image"]
+
+def attach_generation_reference_field(body, field, image_payload):
+    if field == "input_image" and len(image_payload) == 1:
+        body[field] = image_payload[0]
+    else:
+        body[field] = image_payload
+
+def generation_reference_schema_error(response):
+    if getattr(response, "status_code", 0) not in (400, 422):
+        return False
+    text = str(getattr(response, "text", "") or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "unknown parameter", "unrecognized", "unexpected", "invalid parameter",
+            "invalid field", "extra fields", "not permitted", "unsupported parameter",
+        )
+    )
 
 def is_gemini_provider(provider):
     return provider_protocol(provider) == "gemini"
@@ -3922,7 +4933,8 @@ async def wait_for_image_task(client, task_id, provider=None):
         if status in {"FAILURE", "FAILED", "FAIL", "ERROR", "ERRORED", "CANCELED", "CANCELLED", "TIMEOUT", "REJECTED", "EXPIRED"}:
             error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
             reason = task_data.get("fail_reason") or task_data.get("message") or error.get("message") or last_payload.get("message") or "生图任务失败"
-            raise HTTPException(status_code=502, detail=f"生图任务失败：{reason}")
+            friendly = friendly_image_error_detail(reason, model=str(task_data.get("model") or ""))
+            raise HTTPException(status_code=502, detail=friendly or f"生图任务失败：{reason}")
         await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     raise HTTPException(status_code=504, detail=f"生图任务超时（已等待 {int(timeout)} 秒），task_id={task_id}")
 
@@ -4096,7 +5108,7 @@ def normalize_asset_library(lib):
         library["id"] = re.sub(r"[^A-Za-z0-9_-]+", "_", str(library.get("id") or f"lib_{uuid.uuid4().hex[:8]}"))[:40]
         library["name"] = sanitize_asset_name(library.get("name") or "资产库", "资产库")
         cats = library.get("categories") if isinstance(library.get("categories"), list) else []
-        if library.get("id") == "default" and not any(c.get("type") == "workflow" for c in cats):
+        if not any(c.get("type") == "workflow" for c in cats):
             cats.append({"id": "workflows", "name": "工作流", "type": "workflow", "items": []})
         for cat in cats:
             for item in (cat.get("items") or []):
@@ -4174,8 +5186,6 @@ def sort_asset_library_items(lib):
 def asset_library_media_kind(path: str, content_type: str = "") -> str:
     ext = os.path.splitext(path or "")[1].lower()
     ct = (content_type or "").lower()
-    if ext in {".json", ".zip"}:
-        return "workflow"
     if ext in {".mp4", ".webm", ".mov", ".m4v", ".mkv"} or ct.startswith("video/"):
         return "video"
     if ext in {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"} or ct.startswith("audio/"):
@@ -4188,9 +5198,8 @@ def asset_library_safe_extension(path: str, kind: str) -> str:
         "image": {".png", ".jpg", ".jpeg", ".webp", ".gif"},
         "video": {".mp4", ".webm", ".mov", ".m4v", ".mkv"},
         "audio": {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"},
-        "workflow": {".json", ".zip"},
     }
-    fallback = {"image": ".png", "video": ".mp4", "audio": ".mp3", "workflow": ".zip"}
+    fallback = {"image": ".png", "video": ".mp4", "audio": ".mp3"}
     return ext if ext in allowed.get(kind, allowed["image"]) else fallback.get(kind, ".png")
 
 def make_asset_library_item(src: str, name: str = "") -> Tuple[str, Dict[str, Any]]:
@@ -4211,51 +5220,6 @@ def make_asset_library_item(src: str, name: str = "") -> Tuple[str, Dict[str, An
     }
     return dest_name, item
     return lib
-
-def asset_library_workflow_category(lib, library_id="", category_id=""):
-    library = find_asset_library(lib, library_id)
-    if not library:
-        raise HTTPException(status_code=404, detail="资产库不存在")
-    categories = library.setdefault("categories", [])
-    cat = None
-    if category_id:
-        cat = next((c for c in categories if c.get("id") == category_id), None)
-        if not cat:
-            raise HTTPException(status_code=404, detail="工作流分类不存在")
-        if cat.get("type") != "workflow":
-            raise HTTPException(status_code=400, detail="目标分组不是工作流分类")
-    if not cat:
-        cat = next((c for c in categories if c.get("type") == "workflow"), None)
-    if not cat:
-        cat = {"id": f"wf_{uuid.uuid4().hex[:12]}", "name": "工作流", "type": "workflow", "items": []}
-        categories.append(cat)
-    lib["active_library_id"] = library.get("id") or lib.get("active_library_id")
-    return library, cat
-
-def make_workflow_library_item_from_bytes(raw: bytes, filename: str, name: str = "") -> Dict[str, Any]:
-    if not raw:
-        raise HTTPException(status_code=400, detail="工作流文件为空")
-    safe_filename = sanitize_export_filename(filename or "canvas-workflow.zip", "canvas-workflow.zip")
-    ext = os.path.splitext(safe_filename)[1].lower()
-    if ext not in {".json", ".zip"}:
-        safe_filename += ".zip"
-        ext = ".zip"
-    dest_name = f"workflow_{uuid.uuid4().hex[:12]}_{safe_filename}"
-    dest_path = os.path.join(ASSET_LIBRARY_DIR, dest_name)
-    os.makedirs(ASSET_LIBRARY_DIR, exist_ok=True)
-    with open(dest_path, "wb") as f:
-        f.write(raw)
-    display_name = sanitize_asset_name(name or os.path.splitext(safe_filename)[0], "工作流")
-    return {
-        "id": f"wf_{uuid.uuid4().hex[:12]}",
-        "name": display_name[:120],
-        "url": f"/assets/library/{dest_name}",
-        "kind": "workflow",
-        "type": "workflow",
-        "format": "zip" if ext == ".zip" else "json",
-        "size": len(raw),
-        "created_at": now_ms(),
-    }
 
 def save_asset_library(lib):
     lib = normalize_asset_library(lib)
@@ -4370,27 +5334,6 @@ def shared_child_abs(folder_abs, rel):
         raise HTTPException(status_code=400, detail="非法路径")
     return abs_path
 
-def image_path_to_data_url(path, max_size=1024):
-    if max_size:
-        try:
-            with Image.open(path) as img:
-                img.load()
-                if max(img.size) > max_size:
-                    img.thumbnail((max_size, max_size), Image.LANCZOS)
-                if img.mode not in ("RGB", "RGBA"):
-                    img = img.convert("RGB")
-                buf = BytesIO()
-                fmt = "PNG" if img.mode == "RGBA" else "JPEG"
-                img.save(buf, format=fmt, quality=88 if fmt == "JPEG" else None)
-                encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-                mime = "image/png" if fmt == "PNG" else "image/jpeg"
-                return f"data:{mime};base64,{encoded}"
-        except Exception as e:
-            print(f"shared caption image resize failed: {e}")
-    with open(path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("ascii")
-    return f"data:{content_type_for_path(path)};base64,{encoded}"
-
 def scan_shared_tree(folder_id, folder_abs, rel_prefix="", display="", counter=None):
     """递归扫描共享文件夹，返回 {id,name,path,items,children}。"""
     if counter is None:
@@ -4455,6 +5398,15 @@ def normalize_prompt_category_id(category="custom"):
     category_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(category or "custom"))[:40] or "custom"
     return "custom" if category_id in {"mine", "my", "personal"} else category_id
 
+def default_user_prompt_library():
+    return {
+        "id": "mine",
+        "name": "我的提示词库",
+        "type": "prompt",
+        "categories": [],
+        "items": [],
+    }
+
 def normalize_prompt_library_item(item):
     if not isinstance(item, dict):
         item = {}
@@ -4483,8 +5435,8 @@ def seed_system_prompt_library():
 
 def default_prompt_libraries():
     return {
-        "active_library_id": "system",
-        "libraries": [seed_system_prompt_library()],
+        "active_library_id": "mine",
+        "libraries": [seed_system_prompt_library(), default_user_prompt_library()],
         "updated_at": now_ms(),
     }
 
@@ -4509,19 +5461,16 @@ def normalize_prompt_template_categories(*category_lists, include_defaults=True)
         if cat_id in seen:
             return
         seen.add(cat_id)
-        # 不再强制把 custom 显示为“我的”，分组名以存储为准，这样内置分组也能被重命名。
-        name = sanitize_asset_name(category.get("name") or cat_id, cat_id)
+        name = "我的" if cat_id == "custom" else sanitize_asset_name(category.get("name") or cat_id, cat_id)
         normalized.append({"id": cat_id, "name": name})
 
-    # 先采用已存储的分组（保留用户对内置分组的重命名/删除），
-    # 只有在系统库一个分组都没有时才补齐默认内置分组（首次初始化）。
+    if include_defaults:
+        for category in defaultPromptTemplateCategories():
+            add_category(category)
     for categories in category_lists:
         if isinstance(categories, list):
             for category in categories:
                 add_category(category)
-    if include_defaults and not normalized:
-        for category in defaultPromptTemplateCategories():
-            add_category(category)
     return normalized
 
 def normalize_prompt_libraries(data):
@@ -4531,6 +5480,8 @@ def normalize_prompt_libraries(data):
     raw_libraries = [lib for lib in raw_libraries if isinstance(lib, dict)]
     if not any(lib.get("id") == "system" for lib in raw_libraries):
         raw_libraries = [seed_system_prompt_library()] + raw_libraries
+    if not any(lib.get("id") != "system" for lib in raw_libraries):
+        raw_libraries.append(default_user_prompt_library())
     libraries = []
     seen_lib_ids = set()
     for raw in raw_libraries:
@@ -4559,6 +5510,7 @@ def normalize_prompt_libraries(data):
             # 非系统库不保留任何内置分组（视角/分镜等），仅保留用户自建分组
             builtin_ids = {"view", "storyboard", "character", "product", "lighting", "custom"}
             raw_categories = [c for c in raw_categories if isinstance(c, dict) and normalize_prompt_category_id(c.get("id") or c.get("name") or "") not in builtin_ids]
+            raw_categories = [{"id": "custom", "name": "我的"}, *raw_categories]
         libraries.append({
             "id": lib_id,
             "name": sanitize_asset_name(raw.get("name") or default_name, default_name),
@@ -4611,6 +5563,15 @@ def find_prompt_library(data, library_id=""):
     libraries = data.get("libraries") if isinstance(data.get("libraries"), list) else []
     library_id = str(library_id or data.get("active_library_id") or "").strip()
     return next((item for item in libraries if item.get("id") == library_id), None) or (libraries[0] if libraries else None)
+
+def find_user_prompt_library(data, library_id=""):
+    library = find_prompt_library(data, library_id)
+    if library and library.get("id") != "system" and not library.get("readonly"):
+        return library
+    return (
+        next((item for item in data.get("libraries", []) if item.get("id") == "mine" and not item.get("readonly")), None)
+        or next((item for item in data.get("libraries", []) if item.get("id") != "system" and not item.get("readonly")), None)
+    )
 
 def sanitize_asset_name(name, fallback="asset"):
     name = re.sub(r'[\\/:*?"<>|]+', "_", str(name or fallback)).strip()
@@ -5139,6 +6100,65 @@ def is_transient_tls_error(exc) -> bool:
         "SSL", "BAD RECORD MAC", "EOF OCCURRED", "DECRYPTION FAILED", "WRONG VERSION NUMBER",
     ))
 
+def exception_diagnostic_text(exc) -> str:
+    parts = []
+    current = exc
+    seen = set()
+    while current and id(current) not in seen and len(parts) < 4:
+        seen.add(id(current))
+        name = type(current).__name__
+        msg = str(current).strip()
+        parts.append(f"{name}: {msg}" if msg else name)
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return " -> ".join(part for part in parts if part) or type(exc).__name__
+
+def public_url_shape(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("data:image/"):
+        header, _, encoded = text.partition(";base64,")
+        approx_bytes = int(len(encoded) * 3 / 4) if encoded else 0
+        return f"data-url:{header.replace('data:', '')}:{approx_bytes}B"
+    if text.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlsplit(text)
+        ext = os.path.splitext(parsed.path)[1].lower()
+        return f"{parsed.scheme}://{parsed.netloc}{ext or ''}"
+    if text.startswith("/assets/") or text.startswith("/output/"):
+        return f"local:{os.path.basename(text.split('?', 1)[0])}"
+    if text.startswith("asset://"):
+        return "asset://"
+    return text[:80] if text else ""
+
+async def httpx_post_with_transient_retry(client, url, *, attempts=3, timeout=None, **kwargs):
+    last_exc = None
+    normal_attempts = max(1, int(attempts or 1))
+    total_attempts = normal_attempts + 1
+    for attempt in range(total_attempts):
+        try:
+            if attempt == 0:
+                return await client.post(url, timeout=timeout, **kwargs)
+            files = kwargs.get("files")
+            if files:
+                for _field, item in files:
+                    try:
+                        item[1].seek(0)
+                    except Exception:
+                        pass
+            async with httpx.AsyncClient(
+                timeout=timeout or getattr(client, "timeout", AI_REQUEST_TIMEOUT),
+                follow_redirects=True,
+                limits=httpx.Limits(max_keepalive_connections=0, max_connections=10),
+                trust_env=attempt < normal_attempts,
+            ) as fresh:
+                return await fresh.post(url, timeout=timeout, **kwargs)
+        except Exception as e:
+            if not is_transient_tls_error(e) or attempt == total_attempts - 1:
+                raise
+            last_exc = e
+            print(f"上游生图 HTTPS/TLS 连接异常，换新连接重试（第 {attempt + 1} 次）：{exception_diagnostic_text(e)}")
+            await asyncio.sleep(0.8 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+
 async def apimart_upload_post(client, upload_url, headers, file_tuple, timeout=60):
     """上传文件到 APIMart，对瞬时 TLS 错误自动重试；重试时改用全新连接，避免复用坏掉的 TLS 连接。
     file_tuple 形如 (filename, content_bytes, content_type)，content 为已读入内存的 bytes，可跨重试复用。"""
@@ -5157,7 +6177,7 @@ async def apimart_upload_post(client, upload_url, headers, file_tuple, timeout=6
             if not is_transient_tls_error(e) or attempt == APIMART_UPLOAD_RETRY_ATTEMPTS - 1:
                 raise
             last_exc = e
-            print(f"APIMart 上传遇到瞬时 TLS 错误，换新连接重试（第 {attempt + 1} 次）：{e}")
+            print(f"APIMart 上传遇到瞬时 TLS 错误，换新连接重试（第 {attempt + 1} 次）：{exception_diagnostic_text(e)}")
             await asyncio.sleep(0.6 * (attempt + 1))
     if last_exc:
         raise last_exc
@@ -5223,6 +6243,56 @@ async def upload_image_for_apimart(client, provider, ref_url: str) -> str:
             print(f"APIMart 文件上传异常: {e}")
             return f"ERR:上传异常 {e}"
     return "ERR:不支持的图片来源（仅支持 http/https/asset/data 或本地 /output/ /assets/ 路径）"
+
+async def apimart_image_reference_for_generation(client, provider, ref_url: str, return_meta: bool = False):
+    """为 APIMart 生图准备参考图。
+    auto 模式：官方上传 URL -> 临时公网 URL -> 压缩 data URL。不同中转站支持面不一致，不能只押一个格式。"""
+    mode = str(os.getenv("APIMART_IMAGE_REFERENCE_MODE", "auto") or "auto").strip().lower()
+    meta = {"mode": mode or "auto", "source": public_url_shape(ref_url), "transport": "", "target": ""}
+
+    def done(value: str, transport: str):
+        meta["transport"] = transport
+        meta["target"] = public_url_shape(value)
+        return (value, dict(meta)) if return_meta else value
+
+    def fail(reason: str):
+        meta["error"] = reason
+        value = f"ERR:{reason}"
+        return (value, dict(meta)) if return_meta else value
+
+    if mode in {"data", "base64", "data-url"}:
+        data_url = reference_to_data_url({"url": ref_url}, max_size=int(os.getenv("APIMART_IMAGE_DATA_URL_MAX_SIZE", "1024") or "1024"))
+        return done(data_url, "data-url") if valid_video_image_input(data_url) else fail("data URL 转换失败")
+
+    upload_error = ""
+    if mode in {"auto", "upload", "official"}:
+        uploaded_url = await upload_image_for_apimart(client, provider, ref_url)
+        if valid_video_image_input(uploaded_url):
+            return done(uploaded_url, "official-upload")
+        upload_error = str(uploaded_url or "上传失败").removeprefix("ERR:")
+        if mode in {"upload", "official"}:
+            return fail(upload_error)
+
+    cloud_error = ""
+    if mode in {"auto", "cloud", "public"}:
+        try:
+            cloud = await upload_local_video_to_cloud(ref_url, os.getenv("APIMART_IMAGE_CLOUD_SERVICE", "auto"))
+            cloud_url = cloud.get("url") if isinstance(cloud, dict) else ""
+            if valid_apimart_video_image_input(cloud_url):
+                meta["cloud_service"] = cloud.get("service") if isinstance(cloud, dict) else ""
+                return done(cloud_url, f"cloud:{meta.get('cloud_service') or 'unknown'}")
+        except Exception as exc:
+            cloud_error = getattr(exc, "detail", None) or exception_diagnostic_text(exc)
+        if mode in {"cloud", "public"}:
+            return fail(cloud_error or "公网临时 URL 上传失败")
+
+    try:
+        data_url = reference_to_data_url({"url": ref_url}, max_size=int(os.getenv("APIMART_IMAGE_DATA_URL_MAX_SIZE", "1024") or "1024"))
+        if valid_video_image_input(data_url):
+            return done(data_url, "data-url-fallback")
+    except Exception as exc:
+        return fail(upload_error or cloud_error or exception_diagnostic_text(exc))
+    return fail(upload_error or cloud_error or "参考图转换失败")
 
 async def upload_video_for_apimart(client, provider, ref_url: str) -> str:
     """尽力把本地参考视频转换为 APIMart 可接受的 http/https 或 asset:// URL。
@@ -5723,6 +6793,72 @@ def is_gpt_image_2_model(model):
         or compact.endswith("gptimage2")
     )
 
+def is_nano_banana_model(model):
+    raw = str(model or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return normalized == "nano-banana" or normalized.startswith("nano-banana-")
+
+def preferred_nano_banana_model(provider):
+    models = [str(item or "").strip() for item in ((provider or {}).get("image_models") or [])]
+    candidates = [item for item in models if is_nano_banana_model(item)]
+    if not candidates:
+        return ""
+    exact = next((item for item in candidates if item.lower() == "nano-banana-pro"), None)
+    return exact or candidates[0]
+
+def provider_has_usable_key(provider):
+    if not provider:
+        return False
+    if provider.get("id") == "modelscope":
+        return bool(modelscope_api_key())
+    if provider.get("id") == "runninghub":
+        return bool(provider_env_key_value(provider["id"]) or runninghub_wallet_key_value())
+    if provider.get("id") == "volcengine":
+        return bool(volcengine_access_key_value() and volcengine_secret_key_value())
+    return bool(provider_env_key_value(provider["id"]))
+
+def choose_nano_banana_provider(current_provider=None):
+    providers = [p for p in load_api_providers() if p.get("enabled", True)]
+    current_id = str((current_provider or {}).get("id") or "").strip().lower()
+    ordered = []
+    if current_provider:
+        ordered.append(current_provider)
+    preferred = next((p for p in providers if p["id"] == "custom-api-3"), None)
+    if preferred:
+        ordered.append(preferred)
+    primary = next((p for p in providers if p.get("primary")), None)
+    if primary:
+        ordered.append(primary)
+    ordered.extend(providers)
+
+    seen = set()
+    for provider in ordered:
+        pid = str(provider.get("id") or "").strip().lower()
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        model = preferred_nano_banana_model(provider)
+        if model and provider_has_usable_key(provider):
+            if current_id and pid != current_id:
+                print(f"GPT-Image-2 请求已自动切换到 {provider.get('name') or pid} / {model}")
+            return provider, model
+    return current_provider, ""
+
+def gpt_image_2_auto_remap_enabled():
+    return str(os.getenv("GPT_IMAGE_2_AUTO_REMAP", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+def remap_gpt_image_2_to_nano(provider, model):
+    if not is_gpt_image_2_model(model):
+        return provider, model
+    if is_apimart_provider(provider):
+        return provider, model
+    if not gpt_image_2_auto_remap_enabled():
+        return provider, model
+    nano_provider, nano_model = choose_nano_banana_provider(provider)
+    if nano_provider and nano_model:
+        return nano_provider, nano_model
+    return provider, model
+
 def normalize_gpt_image_2_size(size):
     width, height = parse_size_pair(size)
     if not width or not height:
@@ -5763,8 +6899,10 @@ def gpt_image_2_size_error_message(size):
             "或把 GPT 尺寸改成 2K / 3840x2160 / 2160x3840 这类更小规格。"
         )
     return (
-        f"GPT-Image-2 不支持当前尺寸 {display_size}。"
-        "请换成 GPT 支持的分辨率，或切换到 nano-banana 生成更高分辨率。"
+        f"上游本次按尺寸拒绝了 GPT-Image-2 请求（当前 {display_size}）。"
+        "这个尺寸没有超过本地 GPT-Image-2 限制；如果是 1024x1024/1:1，"
+        "65535/APIMart 已验证可用，通常是上游通道、账号池或兼容层临时返回了尺寸拒绝。"
+        "请重试，或临时切换分辨率/平台确认。"
     )
 
 def gpt_image_2_size_exceeds_supported(size):
@@ -5856,6 +6994,26 @@ def normalize_volcengine_size(size, model=""):
 def friendly_image_error_detail(text, size="", model=""):
     text = str(text or "")
     lower_text = text.lower()
+    if "all accounts" in lower_text and ("exhausted" in lower_text or "unschedulable" in lower_text):
+        return (
+            "上游 GPT-Image-2 专用账号池当前不可用（额度耗尽、限流、禁用或无法调度）。"
+            "本地 API Key、提示词、尺寸和参考图传输已经通过；请稍后重试，或切换到另一个有可用 image2 资源池的平台。"
+        )
+    if "no available compatible accounts" in lower_text:
+        return (
+            "上游平台当前没有可用的 GPT-Image-2 兼容账号池，常见于该平台 image2 通道额度耗尽、账号被限流或暂时下线。"
+            "这不是画布禁用了平台，也不是本地 API 配置被关掉；请稍后重试，或切换到 65535 等当前有可用账号池的平台。"
+        )
+    if "servers are currently overloaded" in lower_text or "currently overloaded" in lower_text:
+        return "上游 GPT-Image-2 服务当前过载。本地请求已经送达上游；请稍后重试，或切换平台/模型。"
+    if "cloudflare" in lower_text and "502" in lower_text:
+        return "上游 API 网关返回 Cloudflare 502，说明该平台源站暂时不可用或响应不完整。不是画布本地接入错误，请稍后重试或切换平台。"
+    if (
+        "decryption_failed_or_bad_record_mac" in lower_text
+        or "bad_record_mac" in lower_text
+        or "ssl" in lower_text and ("decrypt" in lower_text or "wrong version number" in lower_text)
+    ):
+        return "上游生图接口的 HTTPS/SSL 连接中断了。通常是网络、代理、证书中间层或上游节点临时异常导致，不是提示词格式问题。请稍后重试，或切换 API 平台/模型；如果连续出现，请检查代理和 API Base URL。"
     if is_gpt_image_2_model(model) and gpt_image_2_size_exceeds_supported(size):
         return gpt_image_2_size_error_message(size)
     mentions_size = any(token in lower_text for token in ["size", "resolution", "dimension"])
@@ -5883,6 +7041,8 @@ def friendly_image_error_detail(text, size="", model=""):
         return f"该模型不支持当前尺寸：{size or '未指定'}。请尝试更换分辨率或模型。"
     if "inputtextsensitivecontentdetected" in lower_text or "policyviolation" in lower_text or "copyright restrictions" in lower_text:
         return "上游内容安全拦截了这段提示词，原因偏向版权/敏感内容限制。请改写提示词，避免直接出现具体 IP、角色名、品牌名、影视/动漫作品名，改成风格特征描述再试。"
+    if "can't help edit this image" in lower_text or "cant help edit this image" in lower_text or "cannot help edit this image" in lower_text:
+        return "上游拒绝编辑这张参考图，属于平台内容安全/图像编辑策略拦截。接口和参考图传输不等于失败；请换一张更中性的参考图，或把提示词改成普通风格/背景/服饰调整再试。"
     if "rejected by the safety system" in lower_text or "image_generation_user_error" in lower_text or "safety system" in lower_text or "content_policy_violation" in lower_text or "content policy" in lower_text:
         return "上游（Azure/OpenAI 系）内容安全系统拒绝了本次生图请求。可能是提示词或参考图触发了内容审核。请改写提示词、避免敏感/暴力/成人/名人/版权角色等描述；若使用了人物参考图，可换一张图再试。这是上游平台的审核策略，并非本系统报错。"
     if "rate limit" in lower_text or "429" in lower_text:
@@ -6681,8 +7841,38 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
         result = await wait_for_runninghub_image_task(client, provider, task_id)
         return runninghub_extract_image(result), result
 
+async def generate_openai_chat_image(prompt, size, model, reference_images=None, provider=None):
+    provider = provider or get_api_provider()
+    chat_url = provider_endpoint_url(provider, "chat_endpoint", "/v1/chat/completions")
+    content = [{"type": "text", "text": str(prompt or "").strip() or "Generate an image."}]
+    for ref in (reference_images or [])[:8]:
+        url = reference_to_data_url(ref, max_size=1536)
+        if url:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "stream": False,
+    }
+    if size:
+        body["size"] = size
+    request_timeout = httpx.Timeout(connect=20.0, read=1800.0, write=180.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=True) as client:
+        response = await httpx_post_with_transient_retry(
+            client,
+            chat_url,
+            headers=api_headers(provider=provider, model=model),
+            json=body,
+            timeout=request_timeout,
+            attempts=4,
+        )
+        response.raise_for_status()
+        raw = response.json()
+        return extract_image(raw), raw
+
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
     provider = get_api_provider(provider_id)
+    provider, model = remap_gpt_image_2_to_nano(provider, model)
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     if is_jimeng_provider(provider):
@@ -6693,8 +7883,11 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
         return await generate_volcengine_provider_image(prompt, size, model, reference_images, provider)
+    if is_nano_banana_model(model) and effective_protocol(provider, model) == "openai":
+        return await generate_openai_chat_image(prompt, size, model, reference_images, provider)
     is_gpt2 = is_gpt_image_2_model(model)
     is_apimart = is_apimart_provider(provider)
+    use_generation_refs = is_gpt2 and gpt_image_2_refs_use_generations(provider)
     quality = str(quality or "").strip().lower()
     if quality not in {"low", "medium", "high"}:
         quality = ""
@@ -6707,21 +7900,25 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     mask_refs = [ref for ref in refs if str(ref.get("role") or "").strip().lower() == "mask" or str(ref.get("name") or "").lower().endswith("_mask.png")]
     image_refs = [ref for ref in refs if ref not in mask_refs]
     request_timeout = httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0) if (is_gpt2 or is_apimart) else AI_REQUEST_TIMEOUT
+    generation_request_meta = {}
     async with httpx.AsyncClient(timeout=request_timeout) as client:
         response = None
         async def post_openai_edits(edit_files=None):
             data = {"model": model, "prompt": prompt, "size": size}
             if quality:
                 data["quality"] = quality
-            return await client.post(
+            return await httpx_post_with_transient_retry(
+                client,
                 edit_url,
                 headers=api_headers(json_body=False, provider=provider, model=model),
                 data=data,
                 files=edit_files if edit_files is not None else {},
+                timeout=request_timeout,
             )
 
         if is_apimart:
             apimart_size, resolution = apimart_size_resolution(size)
+            reference_mode = str(os.getenv("APIMART_IMAGE_REFERENCE_MODE", "auto") or "auto").strip().lower() or "auto"
             # APIMart 的 GPT-Image-2 图生图仍走 /images/generations，
             # 通过 image_urls 传参考图，不使用 OpenAI multipart /images/edits。
             body = {
@@ -6732,16 +7929,95 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 "resolution": resolution,
                 "official_fallback": False,
             }
+            generation_request_meta = {
+                "reference_transport_mode": reference_mode,
+                "api_size": apimart_size,
+                "resolution": resolution,
+                "endpoint_host": endpoint_shape(gen_url).get("host") or "",
+                "endpoint_path": endpoint_shape(gen_url).get("path") or "",
+            }
             if image_refs:
-                body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:16]]
-            response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
+                uploaded_image_urls = []
+                upload_errors = []
+                reference_items = []
+                for ref in image_refs[:16]:
+                    uploaded_url, ref_meta = await apimart_image_reference_for_generation(client, provider, ref.get("url", ""), return_meta=True)
+                    reference_items.append(ref_meta)
+                    if valid_video_image_input(uploaded_url):
+                        uploaded_image_urls.append(uploaded_url)
+                    else:
+                        upload_errors.append(str(uploaded_url or "上传失败").removeprefix("ERR:"))
+                if upload_errors:
+                    raise HTTPException(status_code=502, detail=f"APIMart 参考图准备失败：{'; '.join(upload_errors[:3])}")
+                body["image_urls"] = uploaded_image_urls
+                actual_transports = [item.get("transport") for item in reference_items if item.get("transport")]
+                generation_request_meta["reference_transport_actual"] = ",".join(dict.fromkeys(actual_transports))
+                generation_request_meta["reference_count_sent"] = len(uploaded_image_urls)
+                generation_request_meta["reference_items"] = reference_items
+            try:
+                response = await httpx_post_with_transient_retry(client, gen_url, headers=api_headers(provider=provider, model=model), json=body, timeout=request_timeout)
+            except httpx.HTTPError as exc:
+                transport = generation_request_meta.get("reference_transport_actual") or f"mode:{reference_mode}"
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"APIMart 生成接口请求失败（{provider.get('name') or provider['id']} / {model}，"
+                        f"{apimart_size}/{resolution}，参考图 {transport}）：{exception_diagnostic_text(exc)}"
+                    )
+                ) from exc
         elif is_gpt2 and not image_refs and not mask_refs:
             body = {"model": model, "prompt": prompt, "size": size}
             if quality:
                 body["quality"] = quality
-            response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
+            response = await httpx_post_with_transient_retry(client, gen_url, headers=api_headers(provider=provider, model=model), json=body, timeout=request_timeout)
             if response.status_code >= 400 and images_api_unsupported(response):
                 response = await post_openai_edits()
+        elif use_generation_refs and image_refs and not mask_refs:
+            # TCDMX and a few OpenAI-compatible proxies route GPT-Image-2 reference
+            # images through /images/generations. Their /images/edits pool may be
+            # unavailable even while /images/generations is healthy.
+            image_payload = []
+            reference_items = []
+            for ref in image_refs[:4]:
+                data_url = reference_to_data_url(ref, max_size=int(os.getenv("GPT_IMAGE_2_GENERATIONS_REF_MAX_SIZE", "1536") or "1536"))
+                if valid_video_image_input(data_url):
+                    image_payload.append(data_url)
+                    reference_items.append({
+                        "source": public_url_shape(ref.get("url") or ""),
+                        "target": public_url_shape(data_url),
+                        "transport": "data-url",
+                    })
+            if not image_payload:
+                raise HTTPException(status_code=400, detail="参考图无法转换为 GPT-Image-2 generations 可用格式")
+            base_body = {"model": model, "prompt": prompt, "size": size, "n": 1}
+            if quality:
+                base_body["quality"] = quality
+            generation_request_meta = {
+                "reference_transport_mode": "generations-json",
+                "reference_transport_actual": "data-url",
+                "reference_count_sent": len(image_payload),
+                "reference_items": reference_items,
+                "endpoint_host": endpoint_shape(gen_url).get("host") or "",
+                "endpoint_path": endpoint_shape(gen_url).get("path") or "",
+            }
+            last_response = None
+            for field in gpt_image_2_generation_reference_fields():
+                body = dict(base_body)
+                attach_generation_reference_field(body, field, image_payload)
+                generation_request_meta["reference_field"] = field
+                response = await httpx_post_with_transient_retry(
+                    client,
+                    gen_url,
+                    headers=api_headers(provider=provider, model=model),
+                    json=body,
+                    timeout=request_timeout,
+                    attempts=1,
+                )
+                last_response = response
+                if response.status_code < 400 or not generation_reference_schema_error(response):
+                    break
+            if response is None:
+                response = last_response
         elif image_refs:
             # 1) OpenAI 协议的图生图/编辑用 multipart 提交到 /images/edits；
             # GPT-Image-2 参考图不能走 /images/generations JSON，否则部分平台会忽略原图或报 Images API unsupported。
@@ -6778,10 +8054,12 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                     fh.close()
             # 2) edits 失败 → 非 GPT-Image-2 可回退到 /images/generations + JSON image:[urls/base64]（grsai 风格）
             if response is None:
+                edit_failure_detail = friendly_image_error_detail(edit_failed_text, size, model)
                 if is_gpt2:
                     raise HTTPException(
                         status_code=502,
-                        detail=f"GPT-Image-2 编辑接口 /images/edits 调用失败：{edit_failed_text[:300] or edit_failed_status}。已停止自动重试，避免上游可能已扣费后再次请求。"
+                        detail=(edit_failure_detail or f"GPT-Image-2 编辑接口 /images/edits 调用失败：{edit_failed_text[:300] or edit_failed_status}")
+                        + "。已停止自动重试，避免上游可能已扣费后再次请求。"
                     )
                 print(f"/images/edits failed ({edit_failed_status}): {edit_failed_text[:200]} → 回退到 /images/generations + image:[] JSON")
                 image_payload = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:4]]
@@ -6792,25 +8070,29 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 }
                 if quality:
                     body["quality"] = quality
-                response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
+                response = await httpx_post_with_transient_retry(client, gen_url, headers=api_headers(provider=provider, model=model), json=body, timeout=request_timeout)
                 if response.status_code >= 400 and images_api_unsupported(response):
                     raise HTTPException(
                         status_code=502,
-                        detail=f"编辑接口 /images/edits 调用失败，且该平台不支持 /images/generations：{edit_failed_text[:300] or edit_failed_status}"
+                        detail=f"编辑接口 /images/edits 调用失败，且该平台不支持 /images/generations：{edit_failure_detail or edit_failed_text[:300] or edit_failed_status}"
                     )
         else:
             body = {"model": model, "prompt": prompt, "size": size, "response_format": "url", "n": 1}
             if quality:
                 body["quality"] = quality
-            response = await client.post(
+            response = await httpx_post_with_transient_retry(
+                client,
                 gen_url,
                 headers=api_headers(provider=provider, model=model),
                 json=body,
+                timeout=request_timeout,
             )
             if response.status_code >= 400 and images_api_unsupported(response):
                 response = await post_openai_edits()
         response.raise_for_status()
         raw = response.json()
+        if isinstance(raw, dict) and generation_request_meta:
+            raw["_request_meta"] = generation_request_meta
         try:
             return extract_image(raw), raw
         except HTTPException:
@@ -6818,6 +8100,8 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             if not task_id:
                 raise
         task_result = await wait_for_image_task(client, task_id, provider)
+        if isinstance(task_result, dict) and generation_request_meta:
+            task_result["_request_meta"] = generation_request_meta
         return extract_image(task_result), task_result
 
 def upstream_message_from_record(item):
@@ -6970,70 +8254,11 @@ def _local_upload_kind_ext(filename, content_type):
 
 def _local_upload_display_name(filename):
     # 文件名形如 up_<hex>_<原始名>；去掉前缀还原展示名
-    base = os.path.basename(str(filename or ""))
-    m = re.match(r"^up_[0-9a-f]{12}_(.+)$", base)
-    return m.group(1) if m else base
-
-def _local_upload_rel_path(value):
-    text = str(value or "").replace("\\", "/").strip().lstrip("/")
-    if not text:
-        return ""
-    norm = os.path.normpath(text).replace("\\", "/")
-    if norm in {".", ""}:
-        return ""
-    if norm.startswith("../") or norm == ".." or os.path.isabs(norm):
-        raise HTTPException(status_code=400, detail="非法路径")
-    return norm
-
-def _local_upload_abs(rel):
-    rel_path = _local_upload_rel_path(rel)
-    path = os.path.abspath(os.path.join(LOCAL_UPLOAD_DIR, rel_path))
-    root = os.path.abspath(LOCAL_UPLOAD_DIR)
-    try:
-        common = os.path.commonpath([root, path])
-    except ValueError:
-        raise HTTPException(status_code=400, detail="非法路径")
-    if common != root:
-        raise HTTPException(status_code=400, detail="非法路径")
-    return rel_path, path
-
-def _local_upload_safe_path(name):
-    filename, path = _local_upload_abs(name)
-    if not filename:
-        raise HTTPException(status_code=400, detail="文件名不能为空")
-    return filename, path
-
-def _local_upload_safe_folder(path_value):
-    rel, path = _local_upload_abs(path_value)
-    return rel, path
-
-def _local_upload_safe_folder_name(name):
-    cleaned = sanitize_asset_name(os.path.basename(str(name or "").strip()), "")
-    cleaned = re.sub(r"[\\/]+", "_", cleaned).strip(" ._")
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="文件夹名称不能为空")
-    return cleaned[:60]
-
-def _local_upload_caption_path(filename):
-    return os.path.splitext(os.path.join(LOCAL_UPLOAD_DIR, filename))[0] + ".txt"
-
-def _read_local_upload_caption(filename):
-    caption_path = _local_upload_caption_path(filename)
-    if not os.path.isfile(caption_path):
-        return "", ""
-    try:
-        with open(caption_path, "r", encoding="utf-8-sig") as f:
-            text = f.read()
-    except UnicodeDecodeError:
-        with open(caption_path, "r", encoding="gb18030", errors="replace") as f:
-            text = f.read()
-    except OSError:
-        return "", ""
-    return text, os.path.basename(caption_path)
+    m = re.match(r"^up_[0-9a-f]{12}_(.+)$", filename)
+    return m.group(1) if m else filename
 
 def _local_upload_item(filename):
     path = os.path.join(LOCAL_UPLOAD_DIR, filename)
-    rel = _local_upload_rel_path(filename)
     try:
         stat = os.stat(path)
         size = stat.st_size
@@ -7042,75 +8267,19 @@ def _local_upload_item(filename):
         size = 0
         created_at = 0
     kind, _ = _local_upload_kind_ext(filename, "")
-    item = {
-        "id": rel,
-        "file": rel,
-        "name": _local_upload_display_name(rel),
-        "url": f"/assets/uploads/{urllib.parse.quote(rel, safe='/')}",
+    return {
+        "id": filename,
+        "file": filename,
+        "name": _local_upload_display_name(filename),
+        "url": f"/assets/uploads/{filename}",
         "kind": kind or "image",
         "size": size,
         "created_at": created_at,
-        "folder": os.path.dirname(rel).replace("\\", "/"),
     }
-    if kind == "image":
-        caption, caption_file = _read_local_upload_caption(filename)
-        item["caption"] = caption
-        item["caption_file"] = caption_file
-    return item
-
-def _local_upload_folder_node(path="", name="全部上传"):
-    rel = _local_upload_rel_path(path)
-    return {
-        "id": rel or "__root__",
-        "path": rel,
-        "name": name if not rel else os.path.basename(rel),
-        "items": [],
-        "children": [],
-    }
-
-def _local_upload_tree_and_items():
-    root_node = _local_upload_folder_node("", "全部上传")
-    folder_map = {"": root_node}
-    items = []
-    for current, dirs, files in os.walk(LOCAL_UPLOAD_DIR):
-        dirs[:] = sorted([d for d in dirs if not d.startswith(".") and not d.startswith("._")], key=str.lower)
-        rel_dir = os.path.relpath(current, LOCAL_UPLOAD_DIR).replace("\\", "/")
-        if rel_dir == ".":
-            rel_dir = ""
-        node = folder_map.get(rel_dir)
-        if node is None:
-            node = _local_upload_folder_node(rel_dir)
-            folder_map[rel_dir] = node
-        for dirname in dirs:
-            child_rel = f"{rel_dir}/{dirname}".lstrip("/")
-            child = _local_upload_folder_node(child_rel)
-            folder_map[child_rel] = child
-            node["children"].append(child)
-        for name in sorted(files, key=str.lower):
-            if name.startswith(".") or name.startswith("._"):
-                continue
-            rel_file = f"{rel_dir}/{name}".lstrip("/")
-            kind, _ = _local_upload_kind_ext(name, "")
-            if kind is None:
-                continue
-            item = _local_upload_item(rel_file)
-            node["items"].append(item)
-            items.append(item)
-    def fill_counts(node):
-        total = len(node.get("items") or [])
-        for child in node.get("children") or []:
-            total += fill_counts(child)
-        node["count"] = total
-        return total
-    fill_counts(root_node)
-    items.sort(key=lambda it: it.get("created_at") or 0, reverse=True)
-    return root_node, items
 
 @app.post("/api/local-assets/upload")
-async def upload_local_assets(files: List[UploadFile] = File(...), folder: str = Form("")):
+async def upload_local_assets(files: List[UploadFile] = File(...)):
     uploaded = []
-    folder_rel, folder_abs = _local_upload_safe_folder(folder)
-    os.makedirs(folder_abs, exist_ok=True)
     for file in files:
         content = await file.read()
         if not content:
@@ -7122,50 +8291,27 @@ async def upload_local_assets(files: List[UploadFile] = File(...), folder: str =
         base = re.sub(r"[^0-9A-Za-z一-鿿._-]+", "_", base).strip("_") or "file"
         base = base[:60]
         filename = f"up_{uuid.uuid4().hex[:12]}_{base}{ext}"
-        rel_name = f"{folder_rel}/{filename}".lstrip("/")
-        path = os.path.join(folder_abs, filename)
+        path = os.path.join(LOCAL_UPLOAD_DIR, filename)
         with open(path, "wb") as f:
             f.write(content)
-        uploaded.append(_local_upload_item(rel_name))
+        uploaded.append(_local_upload_item(filename))
     return {"files": uploaded}
 
 @app.get("/api/local-assets")
 async def list_local_assets():
-    tree, items = _local_upload_tree_and_items()
-    return {"items": items, "tree": tree}
-
-@app.post("/api/local-assets/folders")
-async def create_local_asset_folder(payload: LocalAssetFolderRequest, request: Request):
-    ensure_same_origin_request(request)
-    parent_rel, parent_abs = _local_upload_safe_folder(payload.parent)
-    if not os.path.isdir(parent_abs):
-        raise HTTPException(status_code=404, detail="父文件夹不存在")
-    name = _local_upload_safe_folder_name(payload.name)
-    rel = f"{parent_rel}/{name}".lstrip("/")
-    _, abs_path = _local_upload_safe_folder(rel)
-    if os.path.exists(abs_path):
-        raise HTTPException(status_code=400, detail="同名文件夹已存在")
-    os.makedirs(abs_path, exist_ok=False)
-    tree, items = _local_upload_tree_and_items()
-    return {"ok": True, "folder": {"path": rel, "name": name}, "tree": tree, "items": items}
-
-@app.patch("/api/local-assets/folders")
-async def rename_local_asset_folder(payload: LocalAssetFolderRequest, request: Request):
-    ensure_same_origin_request(request)
-    rel, abs_path = _local_upload_safe_folder(payload.path)
-    if not rel:
-        raise HTTPException(status_code=400, detail="根目录不能重命名")
-    if not os.path.isdir(abs_path):
-        raise HTTPException(status_code=404, detail="文件夹不存在")
-    name = _local_upload_safe_folder_name(payload.name)
-    parent = os.path.dirname(rel).replace("\\", "/")
-    new_rel = f"{parent}/{name}".lstrip("/")
-    _, new_abs = _local_upload_safe_folder(new_rel)
-    if os.path.exists(new_abs):
-        raise HTTPException(status_code=400, detail="同名文件夹已存在")
-    os.rename(abs_path, new_abs)
-    tree, items = _local_upload_tree_and_items()
-    return {"ok": True, "folder": {"path": new_rel, "name": name}, "tree": tree, "items": items}
+    try:
+        names = os.listdir(LOCAL_UPLOAD_DIR)
+    except OSError:
+        names = []
+    items = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        if not os.path.isfile(os.path.join(LOCAL_UPLOAD_DIR, name)):
+            continue
+        items.append(_local_upload_item(name))
+    items.sort(key=lambda it: it.get("created_at") or 0, reverse=True)
+    return {"items": items}
 
 @app.post("/api/local-assets/delete")
 async def delete_local_assets(payload: dict, request: Request):
@@ -7175,73 +8321,17 @@ async def delete_local_assets(payload: dict, request: Request):
         names = []
     deleted = []
     for name in names:
-        try:
-            rel, path = _local_upload_safe_path(name)
-        except HTTPException:
+        name = os.path.basename(str(name or "").strip())
+        if not name:
             continue
+        path = os.path.join(LOCAL_UPLOAD_DIR, name)
         if os.path.isfile(path):
             try:
                 os.remove(path)
-                txt_path = _local_upload_caption_path(rel)
-                if os.path.isfile(txt_path):
-                    os.remove(txt_path)
-                deleted.append(rel)
+                deleted.append(name)
             except OSError:
                 pass
     return {"deleted": deleted}
-
-@app.post("/api/local-assets/caption")
-async def caption_local_assets(payload: LocalAssetCaptionRequest):
-    prompt = (payload.prompt or "描述图片").strip() or "描述图片"
-    items = []
-    ok_count = 0
-    for name in (payload.names or [])[:100]:
-        item = {"name": name, "ok": False, "caption": "", "caption_file": "", "error": ""}
-        try:
-            filename, path = _local_upload_safe_path(name)
-            if not os.path.isfile(path):
-                raise HTTPException(status_code=404, detail="文件不存在")
-            kind, _ = _local_upload_kind_ext(filename, "")
-            if kind != "image":
-                raise HTTPException(status_code=400, detail="仅支持图片素材反推提示词")
-            caption, resolved_model = await caption_image_with_provider(
-                path,
-                prompt,
-                payload.provider,
-                payload.model,
-                payload.ms_model,
-            )
-            txt_path = _local_upload_caption_path(filename)
-            with open(txt_path, "w", encoding="utf-8", newline="") as f:
-                f.write(caption)
-            item.update({
-                "ok": True,
-                "name": filename,
-                "caption": caption,
-                "caption_file": os.path.basename(txt_path),
-                "model": resolved_model,
-            })
-            ok_count += 1
-        except HTTPException as exc:
-            item["error"] = str(exc.detail or "反推失败")
-        except Exception as exc:
-            item["error"] = str(exc) or "反推失败"
-        items.append(item)
-    return {"ok": True, "count": ok_count, "items": items}
-
-@app.patch("/api/local-assets/caption")
-async def save_local_asset_caption(payload: LocalAssetCaptionSaveRequest):
-    filename, path = _local_upload_safe_path(payload.name)
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="文件不存在")
-    kind, _ = _local_upload_kind_ext(filename, "")
-    if kind != "image":
-        raise HTTPException(status_code=400, detail="仅支持图片素材保存提示词")
-    caption = str(payload.caption or "")[:100000]
-    txt_path = _local_upload_caption_path(filename)
-    with open(txt_path, "w", encoding="utf-8", newline="") as f:
-        f.write(caption)
-    return {"ok": True, "caption": caption, "caption_file": os.path.basename(txt_path)}
 
 @app.post("/api/temp-sh/upload")
 async def temp_sh_upload(payload: TempShUploadRequest, request: Request):
@@ -7810,18 +8900,20 @@ async def save_providers(payload: List[ApiProviderPayload]):
 
 @app.get("/api/config/token")
 async def get_global_token():
-    # 优先读 env，回退到 global_config.json（兼容旧数据）
+    # 只暴露是否已配置，不把完整 Token 发给浏览器；后端生成接口会自行读取 env。
+    expose_token = str(os.getenv("ALLOW_BROWSER_TOKEN_READ", "") or "").strip().lower() in {"1", "true", "yes", "on"}
     saved_token = modelscope_api_key()
     if saved_token:
-        return {"token": saved_token}
+        return {"has_token": True, "token": saved_token if expose_token else "", "key_preview": mask_secret(saved_token)}
     if os.path.exists(GLOBAL_CONFIG_FILE):
         try:
             with open(GLOBAL_CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-                return {"token": config.get("modelscope_token", "")}
+                legacy_token = config.get("modelscope_token", "")
+                return {"has_token": bool(legacy_token), "token": legacy_token if expose_token else "", "key_preview": mask_secret(legacy_token)}
         except:
             pass
-    return {"token": ""}
+    return {"has_token": False, "token": "", "key_preview": ""}
 
 # --- 在线生图 (COMFLY) ---
 
@@ -8337,25 +9429,169 @@ async def fetch_upstream_models(provider_id: str):
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider_id} 未配置 API Key")
     return await fetch_models_from_upstream(provider.get("base_url") or "", api_key, provider_protocol(provider))
 
-async def build_online_image_result(payload: OnlineImageRequest):
-    provider = get_api_provider(payload.provider_id)
-    default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
-    model = selected_model(payload.model, default_model)
+def endpoint_shape(url):
+    raw = str(url or "").strip()
+    if not raw:
+        return {"host": "", "path": ""}
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme and parsed.netloc:
+        return {"host": parsed.netloc, "path": parsed.path or "/"}
+    return {"host": "", "path": raw.split("?", 1)[0]}
+
+def online_image_endpoint_info(provider, model, refs):
+    protocol = effective_protocol(provider, model)
+    family = protocol
+    url = ""
+    details = {}
+    if provider.get("id") == "modelscope":
+        family = "modelscope"
+    elif is_jimeng_provider(provider):
+        family = "jimeng"
+    elif is_runninghub_provider(provider):
+        family = "runninghub"
+        try:
+            url = runninghub_task_endpoint(provider, model)
+        except Exception:
+            url = provider.get("base_url") or ""
+    elif is_volcengine_provider(provider):
+        family = "volcengine"
+    elif protocol == "gemini":
+        family = "gemini"
+    elif is_nano_banana_model(model) and protocol == "openai":
+        family = "openai-chat-completions"
+        url = provider_endpoint_url(provider, "chat_endpoint", "/v1/chat/completions")
+    elif is_apimart_provider(provider):
+        family = "apimart-images-generations"
+        url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/images/generations")
+    elif is_gpt_image_2_model(model) and refs and gpt_image_2_refs_use_generations(provider):
+        family = "openai-images-generations-refs"
+        url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/images/generations")
+    elif refs:
+        family = "openai-images-edits"
+        url = provider_endpoint_url(provider, "image_edit_endpoint", "/v1/images/edits")
+    else:
+        family = "openai-images-generations"
+        url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/images/generations")
+    details.update(endpoint_shape(url))
+    details["family"] = family
+    return details
+
+def resolve_online_image_request(payload: OnlineImageRequest):
+    requested_provider = get_api_provider(payload.provider_id)
+    default_model = (requested_provider.get("image_models") or [IMAGE_MODEL])[0]
+    requested_model = selected_model(payload.model, default_model)
+    provider, model = remap_gpt_image_2_to_nano(requested_provider, requested_model)
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
     count = max(1, min(8, int(payload.n or 1)))
+    remapped = requested_provider["id"] != provider["id"] or requested_model != model
+    protocol = effective_protocol(provider, model)
+    endpoint = online_image_endpoint_info(provider, model, refs)
+    api_size = payload.size
+    resolution = ""
+    if is_apimart_provider(provider):
+        api_size, resolution = apimart_size_resolution(payload.size)
+    warnings = []
+    if remapped:
+        warnings.append(
+            f"已从 {requested_provider.get('name') or requested_provider['id']} / {requested_model} "
+            f"自动切换到 {provider.get('name') or provider['id']} / {model}"
+        )
+    if not provider_has_usable_key(provider):
+        warnings.append(f"{provider.get('name') or provider['id']} 未配置可用 API Key")
+    if is_runninghub_provider(provider) and not provider_has_usable_key(provider):
+        warnings.append("RunningHub 需要有效 API Key 或 Wallet API Key，否则会返回 TOKEN_INVALID")
+    if is_gpt_image_2_model(model) and gpt_image_2_size_exceeds_supported(payload.size):
+        warnings.append(gpt_image_2_size_error_message(payload.size))
+    request_meta = {
+        "provider_id": requested_provider["id"],
+        "provider_name": requested_provider.get("name") or requested_provider["id"],
+        "model": requested_model,
+        "size": payload.size,
+        "quality": payload.quality,
+        "n": count,
+        "reference_count": len(refs),
+    }
+    resolved_meta = {
+        "provider_id": provider["id"],
+        "provider_name": provider.get("name") or provider["id"],
+        "model": model,
+        "size": payload.size,
+        "quality": payload.quality,
+        "n": count,
+        "reference_count": len(refs),
+        "protocol": protocol,
+        "has_key": provider_has_usable_key(provider),
+        "remapped": remapped,
+        "endpoint_family": endpoint.get("family") or "",
+        "endpoint_host": endpoint.get("host") or "",
+        "endpoint_path": endpoint.get("path") or "",
+    }
+    if api_size != payload.size:
+        resolved_meta["api_size"] = api_size
+    if resolution:
+        resolved_meta["resolution"] = resolution
+    if refs:
+        if is_apimart_provider(provider):
+            reference_mode = str(os.getenv("APIMART_IMAGE_REFERENCE_MODE", "auto") or "auto").strip().lower() or "auto"
+            resolved_meta["reference_transport"] = f"apimart-{reference_mode}"
+        elif is_gpt_image_2_model(model) and gpt_image_2_refs_use_generations(provider):
+            resolved_meta["reference_transport"] = "generations-data-url"
+            resolved_meta["reference_field"] = gpt_image_2_generation_reference_fields()[0]
+        elif is_nano_banana_model(model) and protocol == "openai":
+            resolved_meta["reference_transport"] = "chat-data-url"
+        else:
+            resolved_meta["reference_transport"] = "multipart-or-data-url"
+    return {
+        "provider": provider,
+        "model": model,
+        "refs": refs,
+        "count": count,
+        "request": request_meta,
+        "resolved": resolved_meta,
+        "warnings": warnings,
+    }
+
+def public_online_image_resolution(resolution):
+    return {
+        "request": resolution.get("request") or {},
+        "resolved": resolution.get("resolved") or {},
+        "warnings": resolution.get("warnings") or [],
+    }
+
+async def build_online_image_result(payload: OnlineImageRequest):
+    resolution = resolve_online_image_request(payload)
+    provider = resolution["provider"]
+    model = resolution["model"]
+    refs = resolution["refs"]
+    count = resolution["count"]
     async def generate_one():
         image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, refs, provider["id"])
         local_url = await save_ai_image_to_output(image_data, prefix="online_")
         return local_url, raw_item
     try:
-        generated = await asyncio.gather(*(generate_one() for _ in range(count)))
+        generated = []
+        for _ in range(count):
+            generated.append(await generate_one())
     except httpx.HTTPStatusError as exc:
         text = exc.response.text or ''
         friendly = friendly_image_error_detail(text, payload.size, model)
         detail = friendly or f"上游生图接口错误：{text[:300]}"
         raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"请求上游生图接口失败：{exc}") from exc
+        diagnostic = exception_diagnostic_text(exc)
+        friendly = friendly_image_error_detail(diagnostic, payload.size, model)
+        detail = friendly or f"请求上游生图接口失败：{diagnostic}"
+        raise HTTPException(status_code=502, detail=detail) from exc
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        if is_transient_tls_error(exc):
+            detail = (
+                "上游生图接口 HTTPS/TLS 连接中断，已自动重试但仍失败。"
+                f"这通常是上游网关、网络代理或线路不稳定导致，不是提示词或比例错误；请稍后重试。诊断：{exception_diagnostic_text(exc)}"
+            )
+            raise HTTPException(status_code=502, detail=detail) from exc
+        raise
 
     local_urls = [url for url, _raw in generated if url]
     raw = generated[0][1] if generated else {}
@@ -8363,6 +9599,12 @@ async def build_online_image_result(payload: OnlineImageRequest):
         provider_name = provider.get("name") or provider["id"]
         raw_text = json.dumps(raw, ensure_ascii=False)[:800] if isinstance(raw, (dict, list)) else str(raw)[:800]
         raise HTTPException(status_code=502, detail=f"{provider_name} 没有返回图片：{raw_text}")
+    raw_request_meta = raw.get("_request_meta") if isinstance(raw, dict) else {}
+    resolved_meta = dict(resolution["resolved"])
+    if isinstance(raw_request_meta, dict):
+        for key in ("reference_transport_mode", "reference_transport_actual", "reference_count_sent", "reference_items", "reference_field", "api_size", "resolution", "endpoint_host", "endpoint_path"):
+            if key in raw_request_meta and raw_request_meta.get(key) not in (None, ""):
+                resolved_meta[key] = raw_request_meta.get(key)
     result = {
         "prompt": payload.prompt,
         "images": local_urls,
@@ -8373,7 +9615,19 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
+        "request": resolution["request"],
+        "resolved": resolved_meta,
+        "warnings": resolution["warnings"],
+        "params": {
+            "provider_id": provider["id"],
+            "provider_name": provider.get("name") or provider["id"],
+            "model": model,
+            "size": payload.size,
+            "quality": payload.quality,
+            "n": count,
+            "reference_count": len(refs),
+            "reference_images": refs,
+        },
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)
@@ -8381,28 +9635,66 @@ async def build_online_image_result(payload: OnlineImageRequest):
         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
     return result
 
+@app.post("/api/online-image/resolve")
+async def resolve_online_image(payload: OnlineImageRequest):
+    return public_online_image_resolution(resolve_online_image_request(payload))
+
 @app.post("/api/online-image")
 async def online_image(payload: OnlineImageRequest):
     return await build_online_image_result(payload)
 
 async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
+    task_resolution = None
+    try:
+        task_resolution = public_online_image_resolution(resolve_online_image_request(payload))
+    except Exception:
+        task_resolution = None
     with CANVAS_TASK_LOCK:
         if task_id in CANVAS_TASKS:
-            CANVAS_TASKS[task_id]["status"] = "running"
+            CANVAS_TASKS[task_id]["status"] = "waiting"
             CANVAS_TASKS[task_id]["updated_at"] = time.time()
+            if task_resolution:
+                CANVAS_TASKS[task_id].update(task_resolution)
     try:
-        result = await build_online_image_result(payload)
+        provider_key = ""
+        try:
+            provider_key = (task_resolution or {}).get("resolved", {}).get("provider_id") or payload.provider_id or "default"
+        except Exception:
+            provider_key = payload.provider_id or "default"
+        provider_semaphore = canvas_image_provider_semaphore(provider_key)
+        async with CANVAS_IMAGE_TASK_SEMAPHORE:
+            async with provider_semaphore:
+                started_at = time.time()
+                with CANVAS_TASK_LOCK:
+                    if task_id in CANVAS_TASKS:
+                        CANVAS_TASKS[task_id]["status"] = "running"
+                        CANVAS_TASKS[task_id]["started_at"] = started_at
+                        CANVAS_TASKS[task_id]["updated_at"] = started_at
+                        created_at = float(CANVAS_TASKS[task_id].get("created_at") or started_at)
+                        CANVAS_TASKS[task_id]["queue_ms"] = max(0, int((started_at - created_at) * 1000))
+                result = await build_online_image_result(payload)
+        finished_at = time.time()
         with CANVAS_TASK_LOCK:
+            started = float(CANVAS_TASKS.get(task_id, {}).get("started_at") or finished_at)
+            created = float(CANVAS_TASKS.get(task_id, {}).get("created_at") or started)
             CANVAS_TASKS[task_id].update({
                 "status": "succeeded",
                 "result": result,
                 "error": "",
-                "updated_at": time.time(),
+                "finished_at": finished_at,
+                "updated_at": finished_at,
+                "queue_ms": max(0, int((started - created) * 1000)),
+                "run_ms": max(0, int((finished_at - started) * 1000)),
+                "total_ms": max(0, int((finished_at - created) * 1000)),
             })
     except JimengPendingError as exc:
         # 即梦云端还在排队：标记为 jimeng_pending，前端据 submit_id 持久续查（任务未丢失）
         info = jimeng_pending_payload(exc)
         with CANVAS_TASK_LOCK:
+            now = time.time()
+            task = CANVAS_TASKS.get(task_id, {})
+            started = float(task.get("started_at") or now)
+            created = float(task.get("created_at") or started)
             CANVAS_TASKS[task_id].update({
                 "status": "jimeng_pending",
                 "jimeng_pending": True,
@@ -8411,34 +9703,52 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
                 "queue_info": exc.queue_info,
                 "message": info["message"],
                 "error": "",
-                "updated_at": time.time(),
+                "updated_at": now,
+                "queue_ms": max(0, int((started - created) * 1000)),
+                "run_ms": max(0, int((now - started) * 1000)),
+                "total_ms": max(0, int((now - created) * 1000)),
             })
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
         status_code = getattr(exc, "status_code", 500)
         with CANVAS_TASK_LOCK:
+            now = time.time()
+            task = CANVAS_TASKS.get(task_id, {})
+            started = float(task.get("started_at") or now)
+            created = float(task.get("created_at") or started)
             CANVAS_TASKS[task_id].update({
                 "status": "failed",
                 "error": str(detail),
                 "status_code": status_code,
-                "updated_at": time.time(),
+                "finished_at": now,
+                "updated_at": now,
+                "queue_ms": max(0, int((started - created) * 1000)),
+                "run_ms": max(0, int((now - started) * 1000)),
+                "total_ms": max(0, int((now - created) * 1000)),
             })
 
 @app.post("/api/canvas-image-tasks")
 async def create_canvas_image_task(payload: OnlineImageRequest):
     task_id = f"canvas_img_{uuid.uuid4().hex}"
+    task_resolution = public_online_image_resolution(resolve_online_image_request(payload))
     with CANVAS_TASK_LOCK:
         CANVAS_TASKS[task_id] = {
             "id": task_id,
             "type": "online-image",
             "status": "queued",
             "created_at": time.time(),
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "queue_ms": 0,
+            "run_ms": 0,
+            "total_ms": 0,
             "updated_at": time.time(),
             "result": None,
             "error": "",
+            **task_resolution,
         }
     asyncio.create_task(run_canvas_image_task(task_id, payload))
-    return {"task_id": task_id, "status": "queued"}
+    return {"task_id": task_id, "status": "queued", **task_resolution}
 
 @app.get("/api/canvas-image-tasks/{task_id}")
 async def get_canvas_image_task(task_id: str):
@@ -8943,13 +10253,9 @@ async def canvas_video(payload: CanvasVideoRequest):
                             "type": "image_url",
                             "image_url": {"url": url},
                         }
-                        # 火山视频接口要求每个 image 内容项都必须带 role。
-                        # volcengine_content_role 对“空 role + image”会返回 None（这是为纯生图
-                        # 路径准备的，避免被火山误判为 r2v）；但在视频生成场景里，图片本就是参考帧，
-                        # 缺省 role 必须回退为 reference_image，否则 mac 等未显式指定首/尾帧 role 的
-                        # 请求会报 "role must be specified for image contents"。
-                        role = volcengine_content_role(ref.role, "image") or "reference_image"
-                        item["role"] = role
+                        role = volcengine_content_role(ref.role, "image")
+                        if role:
+                            item["role"] = role
                         body["content"].append(item)
                         image_like_urls.add(url)
                     for url in (payload.videos or [])[:3]:
@@ -9307,6 +10613,29 @@ async def touch_canvas(canvas_id: str):
     save_canvas(canvas)
     return {"canvas": canvas_record(canvas), "updated_at": canvas.get("updated_at", 0)}
 
+@app.get("/api/canvas-agent/canvases/{canvas_id}")
+async def canvas_agent_inspect(canvas_id: str):
+    canvas = load_canvas(canvas_id)
+    return {"canvas": agent_canvas_snapshot(canvas)}
+
+@app.post("/api/canvas-agent/canvases/{canvas_id}/actions")
+async def canvas_agent_action(canvas_id: str, payload: CanvasAgentCommand):
+    canvas = load_canvas(canvas_id)
+    action = (payload.action or "").strip().lower()
+    if action in {"inspect", "status"}:
+        return {"ok": True, "canvas": agent_canvas_snapshot(canvas)}
+    if action in {"create_recreate_flow", "recreate_flow", "reference_recreate"}:
+        result = agent_create_recreate_flow(canvas, payload)
+    elif action in {"compose_generation_board", "compose_board", "create_generation_board", "visual_plan"}:
+        result = agent_compose_generation_board(canvas, payload)
+    elif action in {"fix_generators", "fix_model", "use_nano"}:
+        result = agent_fix_generators(canvas, payload)
+    else:
+        raise HTTPException(status_code=400, detail="不支持的 Agent 动作")
+    save_canvas(canvas)
+    await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), "canvas-agent")
+    return {"ok": True, "result": result, "canvas": agent_canvas_snapshot(canvas)}
+
 @app.get("/api/smart-canvas/prompt-templates")
 async def smart_canvas_prompt_templates():
     try:
@@ -9391,196 +10720,6 @@ def sanitize_export_filename(name: str, fallback: str) -> str:
     base = os.path.basename(str(name or "").strip()) or fallback
     base = re.sub(r'[\\/:*?"<>|]+', "_", base)
     return base or fallback
-
-def canvas_workflow_collect_resource_refs(value, found=None):
-    if found is None:
-        found = []
-    if isinstance(value, dict):
-        for item in value.values():
-            canvas_workflow_collect_resource_refs(item, found)
-    elif isinstance(value, list):
-        for item in value:
-            canvas_workflow_collect_resource_refs(item, found)
-    elif isinstance(value, str):
-        text = value.strip()
-        if (text.startswith("/assets/") or text.startswith("/output/")) and output_file_from_url(text):
-            found.append(text)
-    return found
-
-def canvas_workflow_unique_archive_name(base, used):
-    safe = sanitize_export_filename(base, "resource.bin")
-    name, ext = os.path.splitext(safe)
-    archive = safe
-    idx = 2
-    while archive in used:
-        archive = f"{name}-{idx}{ext}"
-        idx += 1
-    used.add(archive)
-    return archive
-
-def canvas_workflow_replace_strings(value, mapping):
-    if isinstance(value, dict):
-        return {k: canvas_workflow_replace_strings(v, mapping) for k, v in value.items()}
-    if isinstance(value, list):
-        return [canvas_workflow_replace_strings(item, mapping) for item in value]
-    if isinstance(value, str):
-        return mapping.get(value, value)
-    return value
-
-def canvas_workflow_payload(nodes, connections, resources=None):
-    return {
-        "format": "infinite-canvas-workflow",
-        "version": 1,
-        "exported_at": now_ms(),
-        "nodes": nodes or [],
-        "connections": connections or [],
-        "resources": resources or [],
-    }
-
-def build_canvas_workflow_archive(payload: CanvasWorkflowExportRequest) -> Tuple[bytes, Dict[str, Any]]:
-    nodes_payload = payload.nodes or []
-    connections_payload = payload.connections or []
-    if not nodes_payload:
-        raise HTTPException(status_code=400, detail="没有可导出的节点")
-    buffer = BytesIO()
-    resources = []
-    used = set()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        if payload.include_resources:
-            for url in canvas_workflow_collect_resource_refs(nodes_payload):
-                if any(item.get("url") == url for item in resources):
-                    continue
-                path = output_file_from_url(url)
-                if not path or not os.path.isfile(path):
-                    continue
-                archive_name = canvas_workflow_unique_archive_name(os.path.basename(path), used)
-                archive_path = f"resources/{archive_name}"
-                zf.write(path, archive_path)
-                resources.append({
-                    "url": url,
-                    "archive": archive_path,
-                    "name": os.path.basename(path),
-                    "size": os.path.getsize(path),
-                })
-        workflow = canvas_workflow_payload(nodes_payload, connections_payload, resources)
-        zf.writestr("workflow.json", json.dumps(workflow, ensure_ascii=False, indent=2))
-    buffer.seek(0)
-    return buffer.getvalue(), {"resources": resources, "node_count": len(nodes_payload), "connection_count": len(connections_payload)}
-
-@app.post("/api/canvas-workflows/export")
-async def export_canvas_workflow(payload: CanvasWorkflowExportRequest):
-    archive, _ = build_canvas_workflow_archive(payload)
-    filename = sanitize_export_filename(payload.filename or "canvas-workflow.zip", "canvas-workflow.zip")
-    if not filename.lower().endswith(".zip"):
-        filename += ".zip"
-    encoded = urllib.parse.quote(filename)
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded}"}
-    return Response(archive, media_type="application/zip", headers=headers)
-
-@app.post("/api/canvas-workflows/export-to-library")
-async def export_canvas_workflow_to_library(payload: CanvasWorkflowExportRequest):
-    archive, meta = build_canvas_workflow_archive(payload)
-    filename = sanitize_export_filename(payload.filename or "canvas-workflow.zip", "canvas-workflow.zip")
-    if not filename.lower().endswith(".zip"):
-        filename += ".zip"
-    lib = load_asset_library()
-    _, cat = asset_library_workflow_category(lib, payload.library_id, payload.category_id)
-    item = make_workflow_library_item_from_bytes(archive, filename, payload.name or os.path.splitext(filename)[0])
-    item["node_count"] = meta.get("node_count") or len(payload.nodes or [])
-    item["connection_count"] = meta.get("connection_count") or len(payload.connections or [])
-    item["resource_count"] = len(meta.get("resources") or [])
-    cat.setdefault("items", []).append(item)
-    save_asset_library(lib)
-    return {"library": lib, "item": item}
-
-@app.post("/api/asset-library/workflows/upload")
-async def upload_asset_library_workflows(
-    files: List[UploadFile] = File(...),
-    library_id: str = Form(""),
-    category_id: str = Form(""),
-):
-    lib = load_asset_library()
-    _, cat = asset_library_workflow_category(lib, library_id, category_id)
-    added = []
-    for file in files[:100]:
-        raw = await file.read()
-        filename = file.filename or "canvas-workflow.zip"
-        lower = filename.lower()
-        if not (lower.endswith(".json") or lower.endswith(".zip") or raw[:2] == b"PK"):
-            continue
-        item = make_workflow_library_item_from_bytes(raw, filename, os.path.splitext(filename)[0])
-        cat.setdefault("items", []).append(item)
-        added.append(item)
-    if not added:
-        raise HTTPException(status_code=400, detail="没有可上传的工作流文件")
-    save_asset_library(lib)
-    return {"library": lib, "items": added}
-
-@app.post("/api/canvas-workflows/import")
-async def import_canvas_workflow(file: UploadFile = File(...)):
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="文件为空")
-    name = str(file.filename or "").lower()
-    resource_mapping = {}
-    workflow = None
-    try:
-        if name.endswith(".zip") or raw[:2] == b"PK":
-            with zipfile.ZipFile(BytesIO(raw), "r") as zf:
-                candidates = [n for n in zf.namelist() if n.lower().endswith("workflow.json")]
-                workflow_name = "workflow.json" if "workflow.json" in zf.namelist() else (candidates[0] if candidates else "")
-                if not workflow_name:
-                    raise HTTPException(status_code=400, detail="压缩包中没有 workflow.json")
-                workflow = json.loads(zf.read(workflow_name).decode("utf-8-sig"))
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                import_dir = os.path.join(OUTPUT_INPUT_DIR, f"workflow_import_{stamp}_{uuid.uuid4().hex[:6]}")
-                os.makedirs(import_dir, exist_ok=True)
-                for res in workflow.get("resources") or []:
-                    archive = str(res.get("archive") or "").replace("\\", "/").lstrip("/")
-                    if not archive or archive not in zf.namelist():
-                        continue
-                    base = sanitize_export_filename(res.get("name") or os.path.basename(archive), os.path.basename(archive) or "resource.bin")
-                    target = os.path.join(import_dir, f"{uuid.uuid4().hex[:8]}_{base}")
-                    with zf.open(archive) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    rel = os.path.relpath(target, ASSETS_DIR).replace("\\", "/")
-                    new_url = f"/assets/{rel}"
-                    old_url = str(res.get("url") or "").strip()
-                    if old_url:
-                        resource_mapping[old_url] = new_url
-                    resource_mapping[archive] = new_url
-                    resource_mapping[f"./{archive}"] = new_url
-                    resource_mapping[os.path.basename(archive)] = new_url
-        else:
-            workflow = json.loads(raw.decode("utf-8-sig"))
-    except HTTPException:
-        raise
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(status_code=400, detail="无法读取压缩包") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"无法解析工作流文件：{exc}") from exc
-    if isinstance(workflow, list):
-        workflow = {"nodes": workflow, "connections": []}
-    if not isinstance(workflow, dict):
-        raise HTTPException(status_code=400, detail="工作流格式不正确")
-    nodes_payload = workflow.get("nodes")
-    connections_payload = workflow.get("connections")
-    if nodes_payload is None and isinstance(workflow.get("workflow"), dict):
-        nodes_payload = workflow["workflow"].get("nodes")
-        connections_payload = workflow["workflow"].get("connections")
-    if not isinstance(nodes_payload, list):
-        raise HTTPException(status_code=400, detail="工作流 JSON 缺少 nodes")
-    if not isinstance(connections_payload, list):
-        connections_payload = []
-    if resource_mapping:
-        nodes_payload = canvas_workflow_replace_strings(nodes_payload, resource_mapping)
-        connections_payload = canvas_workflow_replace_strings(connections_payload, resource_mapping)
-    return {
-        "workflow": canvas_workflow_payload(nodes_payload, connections_payload, workflow.get("resources") or []),
-        "nodes": nodes_payload,
-        "connections": connections_payload,
-        "resource_map": resource_mapping,
-    }
 
 def smart_group_export_folder(folder: str, group_name: str) -> str:
     text = str(folder or "").strip()
@@ -9693,7 +10832,7 @@ async def delete_prompt_library(library_id: str):
 @app.post("/api/prompt-libraries/items")
 async def add_prompt_library_item(payload: PromptLibraryItemRequest):
     data = load_prompt_libraries()
-    library = find_prompt_library(data, payload.library_id)
+    library = find_user_prompt_library(data, payload.library_id)
     if not library:
         raise HTTPException(status_code=404, detail="提示词库不存在")
     if not str(payload.positive or "").strip():
@@ -9775,7 +10914,7 @@ PROMPT_BUILTIN_CATEGORY_IDS = {"view", "storyboard", "character", "product", "li
 @app.post("/api/prompt-libraries/categories")
 async def add_prompt_library_category(payload: PromptLibraryCategoryRequest):
     data = load_prompt_libraries()
-    library = find_prompt_library(data, payload.library_id) or find_prompt_library(data, "system")
+    library = find_user_prompt_library(data, payload.library_id)
     if not library:
         raise HTTPException(status_code=404, detail="提示词库不存在")
     name = sanitize_asset_name(payload.name, "新分组")
@@ -9790,8 +10929,8 @@ async def add_prompt_library_category(payload: PromptLibraryCategoryRequest):
 
 @app.patch("/api/prompt-libraries/categories/{category_id}")
 async def rename_prompt_library_category(category_id: str, payload: PromptLibraryCategoryRequest):
-    # 系统库（内置）分组也允许重命名：分组的 id 不变，只改显示名，
-    # 这样画布与素材库管理共用同一份分组数据，重命名两端实时同步。
+    if category_id in PROMPT_BUILTIN_CATEGORY_IDS:
+        raise HTTPException(status_code=400, detail="内置分组不能重命名")
     name = sanitize_asset_name(payload.name, "")
     if not name:
         raise HTTPException(status_code=400, detail="分组名称不能为空")
@@ -9809,7 +10948,8 @@ async def rename_prompt_library_category(category_id: str, payload: PromptLibrar
 
 @app.delete("/api/prompt-libraries/categories/{category_id}")
 async def delete_prompt_library_category(category_id: str):
-    # 系统库（内置）分组也允许删除，与素材库管理/画布保持一致。
+    if category_id in PROMPT_BUILTIN_CATEGORY_IDS:
+        raise HTTPException(status_code=400, detail="内置分组不能删除")
     data = load_prompt_libraries()
     found = False
     for library in data.get("libraries", []) or []:
@@ -9818,11 +10958,9 @@ async def delete_prompt_library_category(category_id: str):
         if len(kept) != len(cats):
             found = True
             library["categories"] = kept
-            # 被删分组下的条目改挂到剩余的第一个分组；若已无分组则归到“未分类”。
-            fallback = next((str(c.get("id")) for c in kept if isinstance(c, dict) and c.get("id")), "")
-            for item in library.get("items", []) or []:
-                if isinstance(item, dict) and item.get("category") == category_id:
-                    item["category"] = fallback
+        for item in library.get("items", []) or []:
+            if isinstance(item, dict) and item.get("category") == category_id:
+                item["category"] = "custom"
     if not found:
         raise HTTPException(status_code=404, detail="分组不存在")
     data = save_prompt_libraries(data)
@@ -9879,7 +11017,7 @@ async def create_asset_library_category(payload: AssetLibraryCategoryRequest):
 @app.patch("/api/asset-library/categories/{category_id}")
 async def rename_asset_library_category(category_id: str, payload: AssetLibraryRenameRequest):
     lib = load_asset_library()
-    _, cat = find_asset_category_with_library(lib, category_id, payload.library_id)
+    _, cat = find_asset_category_with_library(lib, category_id)
     if not cat:
         raise HTTPException(status_code=404, detail="分类不存在")
     cat["name"] = sanitize_asset_name(payload.name, cat.get("name") or "新文件夹")
@@ -9887,12 +11025,12 @@ async def rename_asset_library_category(category_id: str, payload: AssetLibraryR
     return {"library": lib, "category": cat}
 
 @app.delete("/api/asset-library/categories/{category_id}")
-async def delete_asset_library_category(category_id: str, library_id: str = ""):
+async def delete_asset_library_category(category_id: str):
     lib = load_asset_library()
-    library, cat = find_asset_category_with_library(lib, category_id, library_id)
+    library, cat = find_asset_category_with_library(lib, category_id)
     if not cat:
         raise HTTPException(status_code=404, detail="分类不存在")
-    if cat.get("type") == "workflow" and category_id == "workflows" and (library.get("id") or "") == "default":
+    if cat.get("type") == "workflow" and category_id == "workflows":
         raise HTTPException(status_code=400, detail="默认工作流分类不能删除")
     library["categories"] = [c for c in library.get("categories", []) if c.get("id") != category_id]
     save_asset_library(lib)
@@ -9921,8 +11059,6 @@ async def batch_add_asset_library_items(payload: AssetLibraryBatchAddRequest):
     cat = find_asset_category_in_library(lib, payload.category_id, payload.library_id)
     if not cat:
         raise HTTPException(status_code=404, detail="分类不存在")
-    if cat.get("type") != "image":
-        raise HTTPException(status_code=400, detail="该分类暂不支持添加媒体")
     for entry in (payload.items or [])[:200]:
         entry.category_id = payload.category_id
         entry.library_id = payload.library_id
@@ -10033,45 +11169,6 @@ async def import_shared_folder_files(payload: SharedFolderImport):
         added.append(item)
     save_asset_library(lib)
     return {"library": lib, "items": added}
-
-async def caption_image_with_provider(abs_path, prompt, provider_id, model, ms_model=""):
-    chat_base, chat_hdrs, resolved_model = resolve_chat_provider(provider_id, model, ms_model)
-    llm_provider = get_api_provider(provider_id) if provider_id not in ("modelscope",) else {}
-    is_apimart = is_apimart_provider(llm_provider)
-    prompt_text = (prompt or "描述图片").strip() or "描述图片"
-    data_url = image_path_to_data_url(abs_path, max_size=1024)
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt_text},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ],
-    }]
-    raw = None
-    try:
-        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
-            req_body = {"model": resolved_model, "messages": messages}
-            if is_apimart:
-                req_body["stream"] = False
-            response = await client.post(
-                f"{chat_base}/chat/completions",
-                headers=chat_hdrs,
-                json=req_body,
-            )
-            response.raise_for_status()
-            raw = response.json()
-    except httpx.HTTPStatusError as exc:
-        body = exc.response.text or ""
-        friendly = friendly_chat_error_detail(body, resolved_model, llm_provider)
-        raise HTTPException(status_code=exc.response.status_code, detail=friendly or f"上游接口错误：{body}") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"请求上游接口失败：{exc}") from exc
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"解析上游响应失败：{exc}") from exc
-    text = text_from_chat_response(raw).strip() if isinstance(raw, dict) else ""
-    return text or "接口返回了空回复。", resolved_model
 
 @app.patch("/api/asset-library/items/{item_id}")
 async def rename_asset_library_item(item_id: str, payload: AssetLibraryRenameRequest):
@@ -10230,14 +11327,13 @@ async def batch_move_asset_library_items(payload: AssetLibraryBatchMoveRequest):
     target_cat = find_asset_category_in_library(lib, payload.target_category_id, payload.target_library_id)
     if not target_cat:
         raise HTTPException(status_code=404, detail="目标分组不存在")
-    target_type = target_cat.get("type") or "image"
+    if target_cat.get("type") != "image":
+        raise HTTPException(status_code=400, detail="目标分组不支持媒体")
     moved = []
     for library in lib.get("libraries", []):
         if payload.library_id and library.get("id") != payload.library_id:
             continue
         for cat in library.get("categories", []):
-            if (cat.get("type") or "image") != target_type:
-                continue
             keep = []
             for item in cat.get("items", []):
                 if item.get("id") in ids:
@@ -10320,8 +11416,9 @@ async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
     canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
     canvas["icon"] = (payload.icon or canvas.get("icon") or "layers")[:32]
     canvas["kind"] = normalize_canvas_kind(canvas.get("kind"))
-    canvas["nodes"] = payload.nodes
-    canvas["connections"] = payload.connections
+    nodes, connections = merge_protected_canvas_agent_results(canvas, payload.nodes, payload.connections)
+    canvas["nodes"] = nodes
+    canvas["connections"] = connections
     if canvas["kind"] == "smart":
         canvas["viewport"] = payload.viewport
     else:
@@ -11724,4 +12821,4 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    uvicorn.run(app, host="0.0.0.0", port=3001)

@@ -16,14 +16,14 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.04.1779672342"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.06.04.1779672342"></script>
-    <script src="/static/js/theme.js?v=2026.06.04.1780456238"></script>
-    <script src="/static/js/i18n.js?v=2026.06.04.1780481181"></script>
-    <script src="/static/js/image-preview.js?v=2026.06.04.1779672341"></script>
-    <script src="/static/js/history-bulk-manager.js?v=2026.06.04.1780450958"></script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/theme.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/i18n.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/image-preview.js?v=2026.06.05-image2-strict-provider"></script>
+    <script src="/static/js/history-bulk-manager.js?v=2026.06.05-image2-strict-provider"></script>
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.06.04.1779672342');
+        @import url('/static/vendor/css/fonts.css?v=2026.06.05-image2-strict-provider');
         :root { --accent:#111827; --bg:#f9fafb; --card:#fff; --easing:cubic-bezier(0.4,0,0.2,1); }
         body { background:var(--bg); font-family:'Inter',-apple-system,sans-serif; color:var(--accent); -webkit-font-smoothing:antialiased; }
         .container-box { max-width:1280px; margin:0 auto; padding:0 40px; margin-top:50px; }
@@ -63,7 +63,7 @@
         .gallery-lightbox { background:rgba(255,255,255,.99); backdrop-filter:blur(22px) saturate(1.05); }
         @keyframes fadeIn { from{opacity:0} to{opacity:1} }
     </style>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.04.1779672341">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.05-image2-strict-provider">
     <style>
         html:not(.studio-theme-dark) body:not(.studio-theme-dark) #lightbox.gallery-lightbox {
             background: rgba(255,255,255,.99) !important;
@@ -253,8 +253,8 @@
         });
         let refs = {1:null,2:null,3:null};
         let refDims = {1:null,2:null,3:null};
-        let provider = 'comfly';
-        let selectedModel = 'gpt-image-2';
+        let provider = '';
+        let selectedModel = '';
         let apiProviders = [];
         let ratio = 'square';
         let resolution = '1k';
@@ -262,6 +262,7 @@
         let customRatioHeight = '';
         let customWidth = '';
         let customHeight = '';
+        let autoFitSourceSize = true;
         let quality = 'auto';
         let outputCount = 1;
         let models = {gpt:'gpt-image-2', nano:'nano-banana-pro'};
@@ -323,6 +324,22 @@
         function providerModels(id){
             return uniqueModels(providerById(id)?.image_models || [models.gpt]);
         }
+        function isNanoModel(model){
+            const name = String(model || '').toLowerCase();
+            return name === 'nano-banana' || name.startsWith('nano-banana-');
+        }
+        function preferredImageProvider(){
+            const providers = imageProviders();
+            return providers.find(p => providerModels(p.id).some(isNanoModel)) || providers[0] || null;
+        }
+        function preferredImageModel(id){
+            const list = providerModels(id);
+            return list.find(m => String(m).toLowerCase() === 'nano-banana-pro')
+                || list.find(isNanoModel)
+                || list[0]
+                || models.nano
+                || models.gpt;
+        }
         /* ---- RunningHub：模型下拉来自 API 设置里配置的工作流 / AI 应用，而非通用 image_models ----
          * 与智能画布一致：value=app:ID / workflow:ID，后端 generate_ai_image 走 RH 工作流运行路径。 */
         function runningHubEntryId(entry, kind){
@@ -343,7 +360,7 @@
             const providerSelect = document.getElementById('providerSelect');
             const modelSelect = document.getElementById('modelSelect');
             const providers = imageProviders();
-            if(!providers.some(p => p.id === provider)) provider = providers[0]?.id || 'comfly';
+            if(!providers.some(p => p.id === provider)) provider = preferredImageProvider()?.id || providers[0]?.id || 'comfly';
             providerSelect.innerHTML = providers.map(p => `<option value="${escapeHtml(p.id)}" ${p.id === provider ? 'selected' : ''}>${escapeHtml(p.name || p.id)}</option>`).join('');
             if(isRunningHubProvider(provider)){
                 const entries = runningHubEntries(provider);
@@ -359,7 +376,7 @@
                     : `<option value="">${escapeHtml(tr('online.rhNoEntries'))}</option>`;
             } else {
                 const modelsForProvider = providerModels(provider);
-                if(!modelsForProvider.includes(selectedModel)) selectedModel = modelsForProvider[0] || models.gpt;
+                if(!modelsForProvider.includes(selectedModel)) selectedModel = preferredImageModel(provider);
                 modelSelect.innerHTML = modelsForProvider.map(m => `<option value="${escapeHtml(m)}" ${m === selectedModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('');
             }
             updateAdaptivePanel();
@@ -416,7 +433,8 @@
                 models.nano = imageModels.find(m => m.toLowerCase().includes('nano')) || 'nano-banana-pro';
                 models.gpt = imageModels.find(m => !m.toLowerCase().includes('nano')) || cfg.image_model || 'gpt-image-2';
                 apiProviders = Array.isArray(cfg.api_providers) ? cfg.api_providers : [];
-                selectedModel = providerModels(provider)[0] || models.gpt;
+                provider = preferredImageProvider()?.id || provider || 'comfly';
+                selectedModel = preferredImageModel(provider);
             } catch(e) {}
             renderProviderControls();
         }
@@ -446,7 +464,7 @@
 
         function setProvider(next){
             provider = next;
-            selectedModel = providerModels(provider)[0] || selectedModel;
+            selectedModel = preferredImageModel(provider) || selectedModel;
             renderProviderControls();
         }
         function setModel(next){
@@ -503,6 +521,7 @@
         function setCustomSize(){
             customWidth = document.getElementById('sizeCustomWidth').value;
             customHeight = document.getElementById('sizeCustomHeight').value;
+            autoFitSourceSize = false;
             resolution = 'custom';
             ratio = '';
             updateSizeUI();
@@ -554,6 +573,16 @@
             customHeight = dim.height;
             updateSizeUI();
         }
+        function autoFitCustomSizeToImage(){
+            if(!autoFitSourceSize) return;
+            const dim = firstReferenceDimension();
+            if(!dim) return;
+            resolution = 'custom';
+            ratio = '';
+            customWidth = dim.width;
+            customHeight = dim.height;
+            updateSizeUI();
+        }
 
         function currentSize(){
             if(resolution === 'custom') return customSizeValue();
@@ -595,6 +624,7 @@
                 document.getElementById(`del${index}`).classList.remove('hidden');
                 getImageDimensions(e.target.result).then(dim => {
                     refDims[index] = dim;
+                    autoFitCustomSizeToImage();
                     updateSizeUI();
                 }).catch(() => {});
             };
@@ -721,6 +751,7 @@
                 setResolution(matchedRes);
             } else {
                 setResolution('custom');
+                autoFitSourceSize = false;
                 const parsed = parseSizeValue(size);
                 customWidth = parsed?.width || '';
                 customHeight = parsed?.height || '';

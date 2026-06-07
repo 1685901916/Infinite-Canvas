@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.log
+server*.log
+server*.out.log
+server*.err.log
+
+.npm-cache/
+output/
+assets/
+data/
+API/.env
+history.json
+
+*.lnk
