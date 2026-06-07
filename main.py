@@ -468,6 +468,12 @@ MODELSCOPE_DEFAULT_LORAS = [
     },
 ]
 MODELSCOPE_DEFAULTS_VERSION = 3
+APIMART_DEFAULT_BASE_URL = "https://api.apimart.ai"
+APIMART_DEFAULT_IMAGE_MODELS = [
+    "gpt-4o-image",
+    "gpt-image-2",
+    "gpt-image-2-official",
+]
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
@@ -709,6 +715,21 @@ def default_api_providers():
             "volcengine_project_name": VOLCENGINE_DEFAULT_PROJECT_NAME,
             "volcengine_region": VOLCENGINE_DEFAULT_REGION,
         },
+        {
+            "id": "apimart",
+            "name": "APIMart",
+            "base_url": APIMART_DEFAULT_BASE_URL,
+            "protocol": "apimart",
+            "image_generation_endpoint": "",
+            "image_edit_endpoint": "",
+            "enabled": True,
+            "primary": False,
+            "image_models": APIMART_DEFAULT_IMAGE_MODELS,
+            "chat_models": [],
+            "video_models": [],
+            "ms_loras": [],
+            "ms_defaults_version": 0,
+        },
     ]
 
 def merge_default_api_providers(providers):
@@ -768,6 +789,16 @@ def merge_default_api_providers(providers):
             current["protocol"] = "volcengine"
             current["volcengine_project_name"] = str(current.get("volcengine_project_name") or VOLCENGINE_DEFAULT_PROJECT_NAME).strip() or VOLCENGINE_DEFAULT_PROJECT_NAME
             current["volcengine_region"] = str(current.get("volcengine_region") or VOLCENGINE_DEFAULT_REGION).strip() or VOLCENGINE_DEFAULT_REGION
+    apimart_default = next((d for d in default_api_providers() if d["id"] == "apimart"), None)
+    if apimart_default:
+        current = next((item for item in merged if item.get("id") == "apimart"), None)
+        if not current:
+            merged.append(apimart_default)
+        else:
+            if not current.get("base_url"):
+                current["base_url"] = apimart_default["base_url"]
+            current["protocol"] = "apimart"
+            current["image_models"] = model_list_from_values([*APIMART_DEFAULT_IMAGE_MODELS, *(current.get("image_models") or [])])
     # 即梦 CLI 不再是强制保留的默认平台：仅在用户已添加了即梦协议的平台时，规范化其默认模型/地址。
     for current in merged:
         if not is_jimeng_provider(current):
@@ -2153,9 +2184,9 @@ try:
 except Exception:
     CANVAS_IMAGE_TASK_CONCURRENCY = 24
 try:
-    CANVAS_IMAGE_PROVIDER_CONCURRENCY = max(1, min(16, int(os.getenv("CANVAS_IMAGE_PROVIDER_CONCURRENCY", "8") or "8")))
+    CANVAS_IMAGE_PROVIDER_CONCURRENCY = max(1, min(16, int(os.getenv("CANVAS_IMAGE_PROVIDER_CONCURRENCY", "16") or "16")))
 except Exception:
-    CANVAS_IMAGE_PROVIDER_CONCURRENCY = 8
+    CANVAS_IMAGE_PROVIDER_CONCURRENCY = 16
 CANVAS_IMAGE_TASK_SEMAPHORE = asyncio.Semaphore(CANVAS_IMAGE_TASK_CONCURRENCY)
 CANVAS_IMAGE_PROVIDER_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
 CANVAS_IMAGE_PROVIDER_SEMAPHORE_LOCK = Lock()
@@ -6798,6 +6829,10 @@ def is_nano_banana_model(model):
     normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
     return normalized == "nano-banana" or normalized.startswith("nano-banana-")
 
+def is_gpt_4o_image_model(model):
+    normalized = re.sub(r"[^a-z0-9]+", "-", str(model or "").strip().lower()).strip("-")
+    return normalized in {"gpt-4o-image", "gpt-4o-image-preview"}
+
 def preferred_nano_banana_model(provider):
     models = [str(item or "").strip() for item in ((provider or {}).get("image_models") or [])]
     candidates = [item for item in models if is_nano_banana_model(item)]
@@ -6909,14 +6944,23 @@ def gpt_image_2_size_exceeds_supported(size):
     width, height = parse_size_pair(size)
     return bool(width and height and (max(width, height) > GPT_IMAGE2_MAX_EDGE or width * height > GPT_IMAGE2_MAX_PIXELS))
 
-def apimart_size_resolution(size):
+def apimart_size_resolution(size, model=""):
     width, height = parse_size_pair(size)
+    strict_gpt_4o = is_gpt_4o_image_model(model)
     if not width or not height:
         raw = str(size or "").strip().lower()
         if raw in {"1k", "2k", "4k"}:
             return "1:1", raw
-        if re.fullmatch(r"(auto|\d+\s*:\s*\d+)", raw):
-            return raw.replace(" ", ""), "1k"
+        if re.fullmatch(r"\d+\s*:\s*\d+", raw):
+            requested = raw.replace(" ", "")
+            if not strict_gpt_4o or requested in {"1:1", "3:2", "2:3"}:
+                return requested, "1k"
+            rw, rh = (int(part) for part in requested.split(":", 1))
+            allowed = [(1, 1, "1:1"), (3, 2, "3:2"), (2, 3, "2:3")]
+            best = min(allowed, key=lambda item: abs((rw / max(1, rh)) - item[0] / item[1]))
+            return best[2], "1k"
+        if raw == "auto":
+            return "1:1", "1k"
         return "1:1", "1k"
     long_edge = max(width, height)
     pixels = width * height
@@ -6926,7 +6970,7 @@ def apimart_size_resolution(size):
         resolution = "2k"
     else:
         resolution = "1k"
-    common = [
+    common = [(1, 1, "1:1"), (3, 2, "3:2"), (2, 3, "2:3")] if strict_gpt_4o else [
         (1, 1, "1:1"), (3, 2, "3:2"), (2, 3, "2:3"), (4, 3, "4:3"), (3, 4, "3:4"),
         (5, 4, "5:4"), (4, 5, "4:5"), (16, 9, "16:9"), (9, 16, "9:16"),
         (2, 1, "2:1"), (1, 2, "1:2"), (3, 1, "3:1"), (1, 3, "1:3"),
@@ -7917,7 +7961,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             )
 
         if is_apimart:
-            apimart_size, resolution = apimart_size_resolution(size)
+            apimart_size, resolution = apimart_size_resolution(size, model)
             reference_mode = str(os.getenv("APIMART_IMAGE_REFERENCE_MODE", "auto") or "auto").strip().lower() or "auto"
             # APIMart 的 GPT-Image-2 图生图仍走 /images/generations，
             # 通过 image_urls 传参考图，不使用 OpenAI multipart /images/edits。
@@ -7940,7 +7984,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 uploaded_image_urls = []
                 upload_errors = []
                 reference_items = []
-                for ref in image_refs[:16]:
+                for ref in image_refs[:5]:
                     uploaded_url, ref_meta = await apimart_image_reference_for_generation(client, provider, ref.get("url", ""), return_meta=True)
                     reference_items.append(ref_meta)
                     if valid_video_image_input(uploaded_url):
@@ -9489,7 +9533,7 @@ def resolve_online_image_request(payload: OnlineImageRequest):
     api_size = payload.size
     resolution = ""
     if is_apimart_provider(provider):
-        api_size, resolution = apimart_size_resolution(payload.size)
+        api_size, resolution = apimart_size_resolution(payload.size, model)
     warnings = []
     if remapped:
         warnings.append(

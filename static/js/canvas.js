@@ -151,7 +151,14 @@ let dragBoard = null;
 let minimapDrag = false;
 let minimapState = null;
 let minimapRenderQueued = false;
+let viewportDragFrame = 0;
+let pendingBoardPanEvent = null;
+let pendingMinimapDragEvent = null;
 let resizeNode = null;
+let nodeDragFrame = 0;
+let nodeDragLastEvent = null;
+let nodeDragDirtyIds = new Set();
+let nodeDragCompletedIds = [];
 let llmPaneDrag = null;
 let tempLink = null;
 let knifeActive = false;
@@ -166,6 +173,8 @@ let linkCreateState = null;
 let internalDrag = false;
 let selected = new Set();
 let saveTimer = null;
+let statusFrame = 0;
+let pendingStatusText = '';
 let creatingCanvas = false;
 let createCanvasKind = 'classic';
 let trashMode = false;
@@ -182,6 +191,10 @@ let remoteSyncTimer = null;
 let remoteSyncInterval = null;
 let remoteSyncBusy = false;
 let lastCanvasUpdatedAt = 0;
+const LOCAL_TEXT_EDIT_GRACE_MS = 1800;
+let activePromptEditNodeId = '';
+let activePromptEditAt = 0;
+let lastLocalCanvasMutationAt = 0;
 let models = {gpt:'gpt-image-2', nano:'nano-banana-pro'};
 let imageModels = ['gpt-image-2', 'nano-banana-pro'];
 let chatModels = ['gpt-4o-mini'];
@@ -213,6 +226,14 @@ let currentOutputLightboxOutId = '';
 let currentOutputLightboxUrl = '';
 const missingAssetUrls = new Set();
 let outputTimer = null;
+let generatorInputRefreshTimer = null;
+let pendingGeneratorInputRefreshIds = new Set();
+let pendingGeneratorInputRefreshAll = false;
+let geometryRefreshFrame = 0;
+let geometryRefreshNeedsFull = false;
+let geometryRefreshAfterLayout = false;
+let pendingGeometryNodeIds = new Set();
+let missingAssetRefreshToken = 0;
 let loopContext = null;
 let clipboard = null;
 let lastImagePasteAt = 0;
@@ -823,8 +844,14 @@ function formatCanvasTime(value){
     return date.toLocaleString(window.StudioI18n?.lang() === 'en' ? 'en-US' : 'zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
 }
 function setStatus(text){
-    document.getElementById('saveState').textContent = text;
-    if(gateStatus) gateStatus.textContent = text;
+    pendingStatusText = text || '';
+    if(statusFrame) return;
+    statusFrame = requestAnimationFrame(() => {
+        statusFrame = 0;
+        const saveState = document.getElementById('saveState');
+        if(saveState) saveState.textContent = pendingStatusText;
+        if(gateStatus) gateStatus.textContent = pendingStatusText;
+    });
 }
 function refreshGateViewControls(){
     canvasGate.classList.toggle('trash-mode', trashMode);
@@ -974,29 +1001,75 @@ function centerViewportOnWorldPoint(point){
     viewport.x = rect.width / 2 - point.x * viewport.scale;
     viewport.y = rect.height / 2 - point.y * viewport.scale;
     applyViewport();
-    renderLinks();
     renderSelectionHub();
+}
+function scheduleViewportDragFrame(){
+    if(viewportDragFrame) return;
+    viewportDragFrame = requestAnimationFrame(applyViewportDragFrame);
+}
+function applyViewportDragFrame(){
+    viewportDragFrame = 0;
+    if(dragBoard && pendingBoardPanEvent){
+        const e = pendingBoardPanEvent;
+        viewport.x = dragBoard.ox + e.clientX - dragBoard.sx;
+        viewport.y = dragBoard.oy + e.clientY - dragBoard.sy;
+        applyViewport();
+        renderSelectionHub();
+    } else if(minimapDrag && pendingMinimapDragEvent){
+        centerViewportOnWorldPoint(minimapEventToWorld(pendingMinimapDragEvent));
+    }
 }
 function refreshGeometry(){
     renderLinks();
     renderSelectionHub();
 }
-function refreshGeometryAfterLayout(){
-    requestAnimationFrame(() => {
-        refreshGeometry();
-        requestAnimationFrame(refreshGeometry);
+function refreshGeometryForNodes(nodeIds){
+    const ids = new Set([...(nodeIds || [])].filter(Boolean));
+    if(ids.size) renderLinksForNodes(ids);
+    else renderLinks();
+    renderSelectionHub();
+}
+function scheduleGeometryRefresh(nodeIds=null, options={}){
+    const ids = [...(nodeIds || [])].filter(Boolean);
+    if(!ids.length) {
+        geometryRefreshNeedsFull = true;
+        pendingGeometryNodeIds.clear();
+    } else if(!geometryRefreshNeedsFull) {
+        ids.forEach(id => pendingGeometryNodeIds.add(id));
+    }
+    if(options.afterLayout) geometryRefreshAfterLayout = true;
+    if(geometryRefreshFrame) return;
+    geometryRefreshFrame = requestAnimationFrame(() => {
+        geometryRefreshFrame = 0;
+        const runFull = geometryRefreshNeedsFull;
+        const runIds = runFull ? [] : [...pendingGeometryNodeIds];
+        geometryRefreshNeedsFull = false;
+        pendingGeometryNodeIds.clear();
+        if(runFull || !runIds.length) refreshGeometry();
+        else refreshGeometryForNodes(runIds);
+        if(geometryRefreshAfterLayout){
+            geometryRefreshAfterLayout = false;
+            requestAnimationFrame(() => {
+                if(runFull || !runIds.length) refreshGeometry();
+                else refreshGeometryForNodes(runIds);
+            });
+        }
     });
+}
+function refreshGeometryAfterLayout(nodeIds=null){
+    scheduleGeometryRefresh(nodeIds, {afterLayout:true});
 }
 function scheduleSave(){
     if(!canvas || applyingRemoteCanvas) return;
     localCanvasDirty = true;
+    lastLocalCanvasMutationAt = nowMs();
     setStatus('Saving...');
     clearTimeout(saveTimer);
     if(savingCanvasNow){
         saveCanvasAgain = true;
         return;
     }
-    saveTimer = setTimeout(saveCanvas, 500);
+    saveTimer = setTimeout(saveCanvas, 900);
 }
 function scheduleViewportSave(){
     saveLocalViewport();
@@ -1044,12 +1117,81 @@ function serializableCanvasNode(node){
 function serializableCanvasNodes(list=nodes){
     return (list || []).map(serializableCanvasNode);
 }
+function markPromptEditing(nodeId){
+    activePromptEditNodeId = String(nodeId || '');
+    activePromptEditAt = nowMs();
+}
+function hasRecentPromptEdit(){
+    return Boolean(activePromptEditNodeId && nowMs() - activePromptEditAt < LOCAL_TEXT_EDIT_GRACE_MS);
+}
+function hasLocalPendingGeneration(){
+    return nodes.some(node => {
+        if(!node) return false;
+        if(node.running || node.runStatus === 'queued' || node.runStatus === 'running') return true;
+        return node.type === 'output' && (node._pending || []).length;
+    });
+}
+function shouldDeferRemoteCanvasApply(options={}){
+    const includePending = options.includePending !== false;
+    return Boolean(localCanvasDirty || saveTimer || savingCanvasNow || saveCanvasAgain || hasRecentPromptEdit() || (includePending && hasLocalPendingGeneration()));
+}
+function deferRemoteCanvasSync(delay=1000){
+    clearTimeout(remoteSyncTimer);
+    remoteSyncTimer = setTimeout(syncRemoteCanvasNow, delay);
+}
+function clonePlain(value, fallback=null){
+    if(value === undefined || value === null) return fallback;
+    try { return JSON.parse(JSON.stringify(value)); }
+    catch(e){ return fallback; }
+}
+function mergeUniqueOutputItems(remoteItems=[], localItems=[]){
+    const result = [];
+    const seen = new Set();
+    const add = item => {
+        const key = outputUrlValue(item) || JSON.stringify(item);
+        if(!key || seen.has(key)) return;
+        seen.add(key);
+        result.push(item);
+    };
+    (remoteItems || []).forEach(add);
+    (localItems || []).forEach(add);
+    return result;
+}
+function preserveLocalRuntimeNodeState(remoteNodes=[]){
+    const localById = new Map((nodes || []).filter(node => node?.id).map(node => [node.id, node]));
+    const keepLocalEdits = Boolean(localCanvasDirty || hasRecentPromptEdit());
+    const keepLocalMedia = Boolean(keepLocalEdits || hasLocalPendingGeneration());
+    return (remoteNodes || []).map(remoteNode => {
+        if(!remoteNode?.id) return remoteNode;
+        const localNode = localById.get(remoteNode.id);
+        if(!localNode) return remoteNode;
+        const merged = {...remoteNode};
+        if(localNode.type === 'prompt' && keepLocalEdits && String(localNode.text || '') !== String(remoteNode.text || '')){
+            merged.text = localNode.text || '';
+        }
+        if(localNode.type === 'output'){
+            if(keepLocalMedia && (localNode._pending || []).length) merged._pending = clonePlain(localNode._pending, localNode._pending || []);
+            if(keepLocalMedia && (localNode.images || []).length) merged.images = mergeUniqueOutputItems(remoteNode.images || [], localNode.images || []);
+        }
+        if(keepLocalMedia && (localNode.generatedOutputs || []).length){
+            merged.generatedOutputs = mergeUniqueOutputItems(remoteNode.generatedOutputs || [], localNode.generatedOutputs || []);
+        }
+        if(localNode.running) merged.running = true;
+        if(localNode.runStatus) merged.runStatus = localNode.runStatus;
+        if(localNode.runError) merged.runError = localNode.runError;
+        if(localNode._cascadeIdx) merged._cascadeIdx = localNode._cascadeIdx;
+        if(localNode._cascadeFailed) merged._cascadeFailed = localNode._cascadeFailed;
+        return merged;
+    });
+}
 async function saveCanvas(){
     if(!canvas || applyingRemoteCanvas) return;
     if(savingCanvasNow){
         saveCanvasAgain = true;
         return;
     }
+    clearTimeout(saveTimer);
+    saveTimer = null;
     sanitizeConnections();
     savingCanvasNow = true;
     saveCanvasAgain = false;
@@ -1071,14 +1213,15 @@ async function saveCanvas(){
         if(res.status === 409){
             const data = await res.json().catch(() => ({}));
             const remote = data.detail?.canvas || data.canvas;
-            if(localCanvasDirty || saveCanvasAgain){
-                localCanvasDirty = false;
-                saveCanvasAgain = false;
-                clearTimeout(saveTimer);
-                saveTimer = null;
-                if(remote) applyRemoteCanvasData(remote);
-                else lastCanvasUpdatedAt = Number(data.detail?.updated_at || data.updated_at || lastCanvasUpdatedAt || 0);
-                setStatus('Synced');
+            const remoteUpdatedAt = Number(data.detail?.updated_at || data.updated_at || remote?.updated_at || 0);
+            if(shouldDeferRemoteCanvasApply()){
+                if(remoteUpdatedAt){
+                    lastCanvasUpdatedAt = remoteUpdatedAt;
+                    canvas.updated_at = remoteUpdatedAt;
+                }
+                localCanvasDirty = true;
+                saveCanvasAgain = true;
+                setStatus('Retrying save...');
                 return;
             }
             if(remote) applyRemoteCanvasData(remote);
@@ -1088,7 +1231,21 @@ async function saveCanvas(){
         if(!res.ok) throw new Error('save failed');
         const data = await res.json().catch(() => ({}));
         const localViewport = {...viewport};
-        if(data.canvas) canvas = {...canvas, ...data.canvas, viewport:localViewport};
+        if(data.canvas){
+            canvas = {
+                ...canvas,
+                title:data.canvas.title ?? canvas.title,
+                icon:data.canvas.icon ?? canvas.icon,
+                kind:data.canvas.kind ?? canvas.kind,
+                logs:data.canvas.logs || canvas.logs || [],
+                settings:data.canvas.settings || canvas.settings || {},
+                created_at:data.canvas.created_at ?? canvas.created_at,
+                updated_at:Number(data.canvas.updated_at || data.updated_at || Date.now()),
+                viewport:localViewport,
+                nodes,
+                connections
+            };
+        }
         viewport = localViewport;
         canvas.updated_at = Number(canvas.updated_at || Date.now());
         lastCanvasUpdatedAt = canvas.updated_at;
@@ -1642,11 +1799,12 @@ async function openCanvas(id){
         if(applyCanvasGeneratorApiDefaults(nodes)) scheduleSave();
         sanitizeConnections();
         pruneMissingComfyWorkflows();
-        await refreshMissingCanvasAssets();
+        missingAssetUrls.clear();
         selected.clear();
         setCanvasMode(true);
         renderCanvasList();
         render();
+        refreshMissingCanvasAssetsInBackground();
         resumeCanvasImageTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
@@ -1657,32 +1815,33 @@ async function openCanvas(id){
 }
 function applyRemoteCanvasData(remote){
     if(!remote || !canvas || remote.id !== canvas.id) return;
-    if(localCanvasDirty || saveTimer || savingCanvasNow || saveCanvasAgain){
-        clearTimeout(remoteSyncTimer);
-        remoteSyncTimer = setTimeout(syncRemoteCanvasNow, 1000);
+    if(shouldDeferRemoteCanvasApply({includePending:false})){
+        deferRemoteCanvasSync(1000);
         return;
     }
     applyingRemoteCanvas = true;
     try {
-        resetCascadeRuntimeState();
+        const preserveRuntime = hasLocalPendingGeneration();
+        if(!preserveRuntime) resetCascadeRuntimeState();
         const localViewport = localViewportForCanvas(canvas.id, viewport || remote.viewport || {x:0, y:0, scale:1});
         const localSelectedIds = new Set(selected);
         canvas = remote;
         canvas.logs = canvas.logs || [];
-        nodes = canvas.nodes || [];
+        nodes = preserveLocalRuntimeNodeState(canvas.nodes || []);
         connections = canvas.connections || [];
         viewport = localViewport;
         canvas.viewport = {...viewport};
         lastCanvasUpdatedAt = Number(canvas.updated_at || Date.now());
         localCanvasDirty = false;
-        resetTransientRunState(nodes);
+        if(!preserveRuntime) resetTransientRunState(nodes);
         if(applyCanvasGeneratorApiDefaults(nodes)) scheduleSave();
         sanitizeConnections();
         pruneMissingComfyWorkflows();
-        refreshMissingCanvasAssets().then(() => render());
+        missingAssetUrls.clear();
         selected = new Set([...localSelectedIds].filter(id => nodes.some(node => node.id === id)));
         renderCanvasList();
         render();
+        refreshMissingCanvasAssetsInBackground();
         resumeCanvasImageTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
@@ -1723,10 +1882,41 @@ function canvasLocalAssetUrls(){
     });
     return [...urls];
 }
+function nodeIdsForAssetUrls(urls=[]){
+    const wanted = new Set((urls || []).filter(Boolean));
+    if(!wanted.size) return [];
+    const ids = new Set();
+    const addIfMatch = (node, value) => {
+        const url = outputUrlValue(value);
+        if(url && wanted.has(url)) ids.add(node.id);
+    };
+    nodes.forEach(node => {
+        if(!node) return;
+        addIfMatch(node, node.url);
+        (node.images || []).forEach(item => addIfMatch(node, item));
+        (node.generatedOutputs || []).forEach(item => addIfMatch(node, item));
+        Object.entries(node.imageComparisons || {}).forEach(([key, value]) => {
+            addIfMatch(node, key);
+            addIfMatch(node, value);
+        });
+        if(CANVAS_GENERATOR_TYPES.includes(node.type)){
+            const sources = orderedSources(node, generatorSources(node));
+            sources.forEach(src => {
+                if(src?.preview && wanted.has(src.preview)) ids.add(node.id);
+                (src?.refs || []).forEach(ref => {
+                    const url = outputUrlValue(ref);
+                    if(url && wanted.has(url)) ids.add(node.id);
+                });
+            });
+        }
+    });
+    return [...ids];
+}
 async function refreshMissingCanvasAssets(){
+    const before = new Set(missingAssetUrls);
     missingAssetUrls.clear();
     const urls = canvasLocalAssetUrls();
-    if(!urls.length) return;
+    if(!urls.length) return [];
     try {
         const data = await fetch('/api/canvas-assets/check', {
             method:'POST',
@@ -1738,9 +1928,26 @@ async function refreshMissingCanvasAssets(){
     } catch(e) {
         console.warn('canvas asset check failed', e);
     }
+    const changed = new Set();
+    before.forEach(url => { if(!missingAssetUrls.has(url)) changed.add(url); });
+    missingAssetUrls.forEach(url => { if(!before.has(url)) changed.add(url); });
+    return [...changed];
+}
+function refreshMissingCanvasAssetsInBackground(){
+    if(!canvas) return;
+    const token = ++missingAssetRefreshToken;
+    refreshMissingCanvasAssets().then(changedUrls => {
+        if(token !== missingAssetRefreshToken || !canvas) return;
+        const ids = nodeIdsForAssetUrls(changedUrls);
+        if(ids.length) refreshNodes(ids);
+    });
 }
 async function syncRemoteCanvasNow(){
     if(!canvas) return;
+    if(shouldDeferRemoteCanvasApply({includePending:false})){
+        deferRemoteCanvasSync(1000);
+        return;
+    }
     try {
         const res = await fetch(`/api/canvases/${canvas.id}`);
         if(!res.ok) throw new Error(tr('canvas.openFailed'));
@@ -1788,11 +1995,12 @@ function handleCanvasUpdatedMessage(data){
     if(data.canvas_id !== canvas.id) return;
     const remoteUpdatedAt = Number(data.updated_at || 0);
     if(remoteUpdatedAt && remoteUpdatedAt <= Number(lastCanvasUpdatedAt || 0)) return;
-    clearTimeout(saveTimer);
-    saveTimer = null;
-    localCanvasDirty = false;
-    clearTimeout(remoteSyncTimer);
-    remoteSyncTimer = setTimeout(syncRemoteCanvasNow, savingCanvasNow ? 700 : 120);
+    if(shouldDeferRemoteCanvasApply({includePending:false})){
+        deferRemoteCanvasSync(1000);
+        setStatus('Local changes pending');
+        return;
+    }
+    deferRemoteCanvasSync(savingCanvasNow ? 700 : 120);
     setStatus('Syncing...');
 }
 async function returnToCanvasManager(){
@@ -5324,7 +5532,6 @@ function render(){
     });
     restoreMediaPlaybackStates(mediaStates);
     restoreOutputScrolls(outputScrolls);
-    refreshGeometry();
     refreshGeometryAfterLayout();
     refreshIcons();
     refreshOutputTimer();
@@ -5348,8 +5555,7 @@ function refreshNodes(ids=[]){
         current.replaceWith(fresh);
     }
     restoreOutputScrolls(outputScrolls);
-    refreshGeometry();
-    refreshGeometryAfterLayout();
+    refreshGeometryAfterLayout(uniqueIds);
     refreshIcons();
     refreshOutputTimer();
 }
@@ -5526,7 +5732,7 @@ function renderNode(node){
             const missing = isMissingAssetUrl(node.url);
             const mediaKind = mediaKindForNode(node);
             const isEditableImage = mediaKind === 'image' && !missing;
-            body.innerHTML = `<div class="image-preview-wrap">${missing ? missingAssetHtml(node.url) : `<img src="${escapeAttr(node.url)}" draggable="false">`}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || 'image')}${missing ? ` · ${langIsEn() ? 'missing' : '文件缺失'}` : ''}</div>`;
+            body.innerHTML = `<div class="image-preview-wrap">${missing ? missingAssetHtml(node.url) : `<img src="${escapeAttr(node.url)}" draggable="false" loading="lazy" decoding="async" fetchpriority="low">`}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || 'image')}${missing ? ` · ${langIsEn() ? 'missing' : '文件缺失'}` : ''}</div>`;
             if(!missing && mediaKind !== 'image'){
                 const mediaHtml = mediaKind === 'video'
                     ? `<div class="media-card video-card"><video src="${escapeAttr(node.url)}" data-url="${escapeAttr(node.url)}" controls preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"></video></div>`
@@ -5569,9 +5775,9 @@ function renderNode(node){
             }
             body.addEventListener('dblclick', openPreview, true);
             if(loadedImg && loadedImg.complete && loadedImg.naturalHeight > 0){
-                requestAnimationFrame(refreshGeometry);
+                scheduleGeometryRefresh([node.id]);
             } else if(loadedImg) {
-                loadedImg.onload = () => refreshGeometryAfterLayout();
+                loadedImg.onload = () => refreshGeometryAfterLayout([node.id]);
             }
         } else {
         body.innerHTML = `<div class="blank-image"><i data-lucide="image-plus" class="w-7 h-7"></i><div class="text-[11px] font-bold">${tr('canvas.clickDragPasteImage')}</div></div>`;
@@ -5594,11 +5800,11 @@ function renderNode(node){
         };
         bindScrollableText(textarea);
         textarea.oninput = e => {
+            markPromptEditing(node.id);
             node.text = e.target.value;
             refreshPromptCounter(body, node.text);
             scheduleSave();
-            syncGeneratorInputs();
-            refreshGeneratorInputViews();
+            scheduleGeneratorInputRefresh(directGeneratorIdsForSources(inputRefreshSourceIdsForNode(node.id)));
         };
     }
     if(node.type === 'loop') body.appendChild(renderLoopBody(node));
@@ -6004,14 +6210,17 @@ function promptTextLength(text){
 function promptCounterHtml(text){
     const count = promptTextLength(text);
     const over = count > PROMPT_TEXT_MAX_LENGTH;
-    return `<div class="prompt-counter ${over ? 'over' : ''}"><span>${count.toLocaleString()}</span><span>/ ${PROMPT_TEXT_MAX_LENGTH.toLocaleString()}</span></div>`;
+    return `<div class="prompt-counter ${over ? 'over' : ''}"><span class="prompt-counter-current">${count.toLocaleString()}</span><span class="prompt-counter-max">/ ${PROMPT_TEXT_MAX_LENGTH.toLocaleString()}</span></div>`;
 }
 function refreshPromptCounter(container, text){
     const counter = container?.querySelector('.prompt-counter');
     if(!counter) return;
     const count = promptTextLength(text);
     counter.classList.toggle('over', count > PROMPT_TEXT_MAX_LENGTH);
-    counter.innerHTML = `<span>${count.toLocaleString()}</span><span>/ ${PROMPT_TEXT_MAX_LENGTH.toLocaleString()}</span>`;
+    const current = counter.querySelector('.prompt-counter-current') || counter.firstElementChild;
+    const max = counter.querySelector('.prompt-counter-max') || counter.children?.[1];
+    if(current) current.textContent = count.toLocaleString();
+    if(max) max.textContent = `/ ${PROMPT_TEXT_MAX_LENGTH.toLocaleString()}`;
 }
 function canvasAssetLibraries(){
     return Array.isArray(canvasAssetLibrary.libraries) && canvasAssetLibrary.libraries.length ? canvasAssetLibrary.libraries : [{id:'default', name:'默认资产库', categories:canvasAssetLibrary.categories || []}];
@@ -6051,7 +6260,7 @@ function canvasAssetThumbHtml(item){
     if(kind === 'audio'){
         return `<div class="canvas-asset-thumb-wrap canvas-asset-file-thumb"><i data-lucide="file-audio" class="w-6 h-6"></i><span>${escapeHtml(item?.name || 'audio')}</span></div>`;
     }
-    return `<div class="canvas-asset-thumb-wrap"><img class="canvas-asset-thumb" src="${thumb}" alt=""></div>`;
+    return `<div class="canvas-asset-thumb-wrap"><img class="canvas-asset-thumb" src="${thumb}" alt="" loading="lazy" decoding="async" fetchpriority="low"></div>`;
 }
 function positionCanvasAssetHoverPreview(event){
     if(!canvasAssetHoverPreview || canvasAssetHoverPreview.hidden || canvasAssetHoverPreview.style.display === 'none') return;
@@ -6277,7 +6486,7 @@ function renderImageAssetManager(){
             <div class="asset-manager-grid">
                 ${items.length ? items.map(item => `<div class="asset-manager-card">
                     <input type="checkbox" data-manager-asset-check="${escapeAttr(item.id)}" ${managerSelectedAssetIds.has(item.id) ? 'checked' : ''}>
-                    <img src="${escapeAttr(item.thumbnail || item.url || '')}" alt="">
+                    <img src="${escapeAttr(item.thumbnail || item.url || '')}" alt="" loading="lazy" decoding="async" fetchpriority="low">
                     <span class="asset-manager-card-name" title="${escapeAttr(item.name || '')}">${escapeHtml(item.name || 'asset')}</span>
                     <div class="asset-manager-card-actions">
                         <button type="button" data-manager-asset-rename="${escapeAttr(item.id)}"><i data-lucide="pencil" class="w-3.5 h-3.5"></i><span>重命名</span></button>
@@ -7895,17 +8104,29 @@ function renderVideoBody(node){
 }
 function renderPromptPreview(container, promptInputs){
     if(!container) return;
+    const signature = promptInputs.map(src => `${src.id}:${src.label}:${src.prompt || ''}`).join('|');
+    if(container.dataset.promptSignature === signature) return;
+    container.dataset.promptSignature = signature;
     container.innerHTML = promptInputs.length ? `<div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Prompts</div>${promptInputs.map(src => `<div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2 line-clamp-2">${escapeHtml(src.label)}</div>`).join('')}` : '';
+}
+function imageInputSignature(imageInputs){
+    return (imageInputs || []).map(src => {
+        const refs = (src.refs || []).map(ref => `${ref.url || ''}:${ref.kind || ''}:${ref.name || ''}:${ref.role || ''}`).join(',');
+        return `${src.id}:${src.preview || ''}:${src.label || ''}:${refs}`;
+    }).join('|');
 }
 function renderImageInputList(list, node, imageInputs, emptyText=null){
     if(!list) return;
+    const signature = `${emptyText || ''}::${imageInputSignature(imageInputs)}`;
+    if(list.dataset.inputSignature === signature) return;
+    list.dataset.inputSignature = signature;
     list.innerHTML = imageInputs.length ? '' : `<div class="text-[11px] text-gray-300 py-2">${escapeHtml(emptyText || tr('canvas.inputImagesEmpty'))}</div>`;
     imageInputs.forEach((src, i) => {
         const item = document.createElement('div');
         item.className = 'input-item';
         item.draggable = true;
         item.dataset.sourceId = src.id;
-        const previewHtml = src.preview && !isMissingAssetUrl(src.preview) ? `<img src="${escapeAttr(src.preview)}">` : (src.preview ? missingAssetHtml(src.preview, true) : '<i data-lucide="image" class="w-6 h-6 text-slate-400"></i>');
+        const previewHtml = src.preview && !isMissingAssetUrl(src.preview) ? `<img src="${escapeAttr(src.preview)}" loading="lazy" decoding="async" fetchpriority="low">` : (src.preview ? missingAssetHtml(src.preview, true) : '<i data-lucide="image" class="w-6 h-6 text-slate-400"></i>');
         item.innerHTML = `<span class="input-index">${i + 1}</span>${previewHtml}<span class="input-label">${escapeHtml(src.label)}</span>`;
         item.ondragstart = e => {
             e.stopPropagation();
@@ -7927,6 +8148,9 @@ function renderImageInputList(list, node, imageInputs, emptyText=null){
 }
 function renderVideoImageInputs(list, node, imageInputs){
     if(!list) return;
+    const signature = imageInputSignature(imageInputs);
+    if(list.dataset.inputSignature === signature) return;
+    list.dataset.inputSignature = signature;
     list.innerHTML = imageInputs.length ? '' : `<div class="text-[11px] text-gray-300 py-2">${tr('canvas.groupEmpty')}</div>`;
     imageInputs.forEach((src, i) => {
         const item = document.createElement('div');
@@ -7934,7 +8158,7 @@ function renderVideoImageInputs(list, node, imageInputs){
         item.draggable = true;
         item.dataset.sourceId = src.id;
         const frameLabel = node.useFrameRoles && i === 0 ? tr('canvas.videoRoleFirstFrame') : node.useFrameRoles && i === 1 ? tr('canvas.videoRoleLastFrame') : '';
-        const previewHtml = src.preview && !isMissingAssetUrl(src.preview) ? `<img src="${escapeAttr(src.preview)}">` : (src.preview ? missingAssetHtml(src.preview, true) : '<i data-lucide="image" class="w-6 h-6 text-slate-400"></i>');
+        const previewHtml = src.preview && !isMissingAssetUrl(src.preview) ? `<img src="${escapeAttr(src.preview)}" loading="lazy" decoding="async" fetchpriority="low">` : (src.preview ? missingAssetHtml(src.preview, true) : '<i data-lucide="image" class="w-6 h-6 text-slate-400"></i>');
         item.innerHTML = `
             <div class="video-input-thumb">
                 <span class="input-index">${i + 1}</span>
@@ -8121,6 +8345,10 @@ function renderComfyBody(node){
     return wrap;
 }
 function renderComfyImages(list, node, imageInputs){
+    if(!list) return;
+    const signature = imageInputSignature(imageInputs);
+    if(list.dataset.inputSignature === signature) return;
+    list.dataset.inputSignature = signature;
     list.innerHTML = imageInputs.length ? '' : `<div class="text-[11px] text-gray-300 py-2">${tr('canvas.groupEmpty')}</div>`;
     imageInputs.forEach((src, i) => {
         const item = document.createElement('div');
@@ -8135,7 +8363,7 @@ function renderComfyImages(list, node, imageInputs){
             ? `<video src="${escapeAttr(src.preview)}" muted preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"></video>`
             : kind === 'audio'
                 ? `<i data-lucide="${icon}" class="w-6 h-6 text-slate-400"></i>`
-                : (src.preview && !isMissingAssetUrl(src.preview) ? `<img src="${escapeAttr(src.preview)}">` : (src.preview ? missingAssetHtml(src.preview, true) : `<i data-lucide="${icon}" class="w-6 h-6 text-slate-400"></i>`));
+                : (src.preview && !isMissingAssetUrl(src.preview) ? `<img src="${escapeAttr(src.preview)}" loading="lazy" decoding="async" fetchpriority="low">` : (src.preview ? missingAssetHtml(src.preview, true) : `<i data-lucide="${icon}" class="w-6 h-6 text-slate-400"></i>`));
         item.innerHTML = `<span class="input-index">${i + 1}</span>${previewHtml}<span class="input-label">${escapeHtml(label)}</span>`;
         item.ondragstart = e => {
             e.stopPropagation();
@@ -8560,7 +8788,7 @@ function rhMediaPreviewHtml(ref, kind){
     const safe = escapeAttr(ref?.url || '');
     if(kind === 'video') return `<video src="${safe}" muted preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"></video>`;
     if(kind === 'audio') return `<i data-lucide="file-audio" class="w-6 h-6 text-slate-400"></i>`;
-    return safe && !isMissingAssetUrl(safe) ? `<img src="${safe}">` : `<i data-lucide="image" class="w-6 h-6 text-slate-400"></i>`;
+    return safe && !isMissingAssetUrl(safe) ? `<img src="${safe}" loading="lazy" decoding="async" fetchpriority="low">` : `<i data-lucide="image" class="w-6 h-6 text-slate-400"></i>`;
 }
 function renderRhBody(node){
     const wrap = document.createElement('div');
@@ -9367,14 +9595,45 @@ function reorderInput(gen, movedId, targetId){
     render();
     scheduleSave();
 }
-function syncGeneratorInputs(){
-    nodes.filter(n => CANVAS_GENERATOR_TYPES.includes(n.type)).forEach(gen => {
+function generatorNodesFromTargets(targets=null){
+    if(!targets) return nodes.filter(n => CANVAS_GENERATOR_TYPES.includes(n.type));
+    const ids = new Set((Array.isArray(targets) ? targets : [targets]).map(item => typeof item === 'string' ? item : item?.id).filter(Boolean));
+    if(!ids.size) return [];
+    return [...ids].map(id => nodes.find(n => n.id === id)).filter(n => n && CANVAS_GENERATOR_TYPES.includes(n.type));
+}
+function directGeneratorIdsForSources(sourceIds=[]){
+    const ids = new Set((sourceIds || []).filter(Boolean));
+    if(!ids.size) return [];
+    const generatorIds = new Set();
+    connections.forEach(c => {
+        if(!ids.has(c.from)) return;
+        const target = nodes.find(n => n.id === c.to);
+        if(target && CANVAS_GENERATOR_TYPES.includes(target.type)) generatorIds.add(target.id);
+    });
+    return [...generatorIds];
+}
+function inputRefreshSourceIdsForNode(nodeId){
+    const ids = new Set([nodeId].filter(Boolean));
+    let expanded = true;
+    while(expanded){
+        expanded = false;
+        nodes.forEach(n => {
+            if((n.type === 'group' || n.type === 'promptGroup') && (n.items || []).some(id => ids.has(id)) && !ids.has(n.id)){
+                ids.add(n.id);
+                expanded = true;
+            }
+        });
+    }
+    return [...ids];
+}
+function syncGeneratorInputs(targets=null){
+    generatorNodesFromTargets(targets).forEach(gen => {
         orderedSources(gen, generatorSources(gen));
         if(gen.type === 'ltxDirector') ltxSyncConnectedImagesToTimeline(gen);
     });
 }
-function refreshGeneratorInputViews(){
-    nodes.filter(n => CANVAS_GENERATOR_TYPES.includes(n.type)).forEach(gen => {
+function refreshGeneratorInputViews(targets=null){
+    generatorNodesFromTargets(targets).forEach(gen => {
         const el = nodesEl.querySelector(`.node[data-id="${gen.id}"]`);
         if(!el) return;
         const sources = orderedSources(gen, generatorSources(gen));
@@ -9397,6 +9656,25 @@ function refreshGeneratorInputViews(){
             renderRhParams(el.querySelector('.rh-param-list'), gen, rhActiveFields(gen), media);
         }
     });
+}
+function flushGeneratorInputRefresh(){
+    clearTimeout(generatorInputRefreshTimer);
+    generatorInputRefreshTimer = null;
+    const targets = pendingGeneratorInputRefreshAll ? null : [...pendingGeneratorInputRefreshIds];
+    pendingGeneratorInputRefreshIds.clear();
+    pendingGeneratorInputRefreshAll = false;
+    syncGeneratorInputs(targets);
+    refreshGeneratorInputViews(targets);
+}
+function scheduleGeneratorInputRefresh(targetIds=null, delay=220){
+    if(!targetIds){
+        pendingGeneratorInputRefreshAll = true;
+        pendingGeneratorInputRefreshIds.clear();
+    } else if(!pendingGeneratorInputRefreshAll) {
+        (Array.isArray(targetIds) ? targetIds : [targetIds]).filter(Boolean).forEach(id => pendingGeneratorInputRefreshIds.add(id));
+    }
+    clearTimeout(generatorInputRefreshTimer);
+    generatorInputRefreshTimer = setTimeout(flushGeneratorInputRefresh, delay);
 }
 async function runGenerator(genId, opts={}){
     const gen = nodes.find(n => n.id === genId);
@@ -11199,7 +11477,7 @@ function renderCanvasLog(){
         const thumbs = (log.outputs || []).slice(0, 8).map(url => {
             const safe = escapeAttr(url);
             if(isMissingAssetUrl(url)) return `<div class="missing-asset compact" data-url="${safe}"><i data-lucide="image-off" class="w-4 h-4"></i></div>`;
-            return isVideoUrl(url) ? `<video src="${safe}" data-url="${safe}" muted playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"></video>` : `<img src="${safe}" data-url="${safe}" alt="output">`;
+            return isVideoUrl(url) ? `<video src="${safe}" data-url="${safe}" muted playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"></video>` : `<img src="${safe}" data-url="${safe}" alt="output" loading="lazy" decoding="async" fetchpriority="low">`;
         }).join('');
         const date = new Date(log.createdAt || Date.now()).toLocaleString(window.StudioI18n?.lang() === 'en' ? 'en-US' : 'zh-CN');
         const req = log.request || {};
@@ -11462,7 +11740,7 @@ function renderOutputMedia(item, useGridLayout=false){
         const label = kind === 'text' ? 'TEXT' : 'FILE';
         return `<div class="output-img-wrap output-file-wrap" data-output-url="${safe}"${gridStyle}><div class="output-file-card"><i data-lucide="${icon}" class="w-7 h-7"></i><span>${escapeHtml(meta.name || outputImageName(url))}</span><small>${label}</small></div>${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
     }
-    return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}><img src="${safe}" data-url="${safe}" alt="generated output">${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
+    return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}><img src="${safe}" data-url="${safe}" alt="generated output" loading="lazy" decoding="async" fetchpriority="low">${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
 }
 function outputGridLayout(node){
     const images = node?.images || [];
@@ -12376,6 +12654,9 @@ function startNodeDrag(e, node){
         [...selected].forEach(id => collect(nodes.find(n => n.id === id)));
     }
     const children = [...collected.values()];
+    nodeDragLastEvent = null;
+    nodeDragDirtyIds = new Set([dragTarget.id, ...children.map(child => child.node?.id).filter(Boolean)]);
+    nodeDragCompletedIds = [];
     dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y};
     document.body.classList.add('canvas-node-drag');
     window.onmousemove = onNodeDrag;
@@ -12383,6 +12664,14 @@ function startNodeDrag(e, node){
 }
 function onNodeDrag(e){
     if(!dragNode) return;
+    nodeDragLastEvent = e;
+    if(nodeDragFrame) return;
+    nodeDragFrame = requestAnimationFrame(applyNodeDragFrame);
+}
+function applyNodeDragFrame(){
+    nodeDragFrame = 0;
+    if(!dragNode || !nodeDragLastEvent) return;
+    const e = nodeDragLastEvent;
     const dx = (e.clientX - dragNode.sx) / viewport.scale;
     const dy = (e.clientY - dragNode.sy) / viewport.scale;
     dragNode.node.x = dragNode.ox + dx;
@@ -12401,9 +12690,8 @@ function onNodeDrag(e){
             childEl.style.top = `${childDrag.node.y}px`;
         }
     });
-    renderLinks();
+    renderLinksForNodes(nodeDragDirtyIds);
     renderSelectionHub();
-    scheduleMinimapRender();
 }
 function startNodeResize(e, node){
     e.preventDefault();
@@ -12434,9 +12722,8 @@ function onNodeResize(e){
         el.style.width = `${resizeNode.node.w}px`;
         el.style.height = `${resizeNode.node.h}px`;
     }
-    renderLinks();
+    renderLinksForNodes([resizeNode.node.id]);
     renderSelectionHub();
-    scheduleMinimapRender();
 }
 function startLink(e, originId, originKind){
     e.stopPropagation();
@@ -12555,14 +12842,30 @@ function sanitizeConnections(){
 function endDrag(event=null){
     const hadContentDrag = Boolean(dragNode || resizeNode || llmPaneDrag || knifeChanged || tempLink);
     const hadViewportDrag = Boolean(dragBoard || minimapDrag);
+    let groupMembershipChanged = false;
+    if(dragNode && nodeDragFrame){
+        cancelAnimationFrame(nodeDragFrame);
+        nodeDragFrame = 0;
+        applyNodeDragFrame();
+    }
+    if(viewportDragFrame){
+        cancelAnimationFrame(viewportDragFrame);
+        applyViewportDragFrame();
+    }
     if(dragNode){
         const moved = [dragNode.node, ...(dragNode.children || []).map(c => c.node)].filter(Boolean);
+        nodeDragCompletedIds = moved.map(n => n.id).filter(Boolean);
         // 拖动 group/promptGroup 自身时不重新评估（成员跟着一起走，包含关系不变）
         const draggedGroup = moved.some(n => n.type === 'group' || n.type === 'promptGroup');
-        if(!draggedGroup) updateGroupMembership(moved);
+        if(!draggedGroup) groupMembershipChanged = updateGroupMembership(moved);
     }
+    const resizeCompletedIds = resizeNode?.node?.id ? [resizeNode.node.id] : [];
     dragNode = null;
+    nodeDragLastEvent = null;
+    nodeDragDirtyIds.clear();
     dragBoard = null;
+    pendingBoardPanEvent = null;
+    pendingMinimapDragEvent = null;
     resizeNode = null;
     llmPaneDrag = null;
     knifeActive = false;
@@ -12577,9 +12880,15 @@ function endDrag(event=null){
     window.onmousemove = null;
     window.onmouseup = null;
     if(shouldRenderKnife) render();
+    else if(!groupMembershipChanged){
+        if(nodeDragCompletedIds.length) refreshGeometryAfterLayout(nodeDragCompletedIds);
+        else if(resizeCompletedIds.length) refreshGeometryAfterLayout(resizeCompletedIds);
+        else if(hadContentDrag) refreshGeometryAfterLayout();
+    }
     scheduleMinimapRender();
     if(hadContentDrag) scheduleSave();
     else if(hadViewportDrag) scheduleViewportSave();
+    nodeDragCompletedIds = [];
 }
 function nodeRect(n){
     const el = nodesEl.querySelector(`.node[data-id="${n.id}"]`);
@@ -12662,6 +12971,7 @@ function updateGroupMembership(movedNodes){
         render();
         scheduleSave();
     }
+    return changed;
 }
 
 function portPoint(id, kind){
@@ -12680,16 +12990,50 @@ function renderLinks(){
     linksEl.innerHTML = '';
     linkControlsEl.innerHTML = '';
     connections.forEach(c => {
-        const a = portPoint(c.from, 'out'), b = portPoint(c.to, 'in');
-        linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, 'link'));
-        const btn = linkDeleteButton(c, a, b);
-        linkControlsEl.appendChild(btn);
-        linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
+        const parts = renderConnectionParts(c);
+        parts.els.forEach(el => linksEl.appendChild(el));
+        linkControlsEl.appendChild(parts.button);
     });
     if(tempLink){
         linksEl.appendChild(pathEl(tempLink.x1, tempLink.y1, tempLink.x2, tempLink.y2, 'link temp'));
     }
     renderKnifeTrail();
+}
+function renderConnectionParts(connection){
+    const a = portPoint(connection.from, 'out'), b = portPoint(connection.to, 'in');
+    const path = pathEl(a.x, a.y, b.x, b.y, 'link');
+    path.dataset.connectionId = connection.id;
+    path.dataset.linkPart = 'line';
+    const hit = linkHitEl(a.x, a.y, b.x, b.y, connection.id);
+    return {els:[path, hit], button:linkDeleteButton(connection, a, b)};
+}
+function renderConnectionEls(connection){
+    return renderConnectionParts(connection).els;
+}
+function renderConnectionButton(connection){
+    return renderConnectionParts(connection).button;
+}
+function replaceConnectionEls(connection){
+    linksEl.querySelectorAll(`[data-connection-id="${CSS.escape(connection.id)}"]`).forEach(el => el.remove());
+    linkControlsEl.querySelectorAll(`[data-connection-id="${CSS.escape(connection.id)}"]`).forEach(el => el.remove());
+    const parts = renderConnectionParts(connection);
+    parts.els.forEach(el => linksEl.appendChild(el));
+    linkControlsEl.appendChild(parts.button);
+}
+function renderLinksForNodes(nodeIds){
+    const ids = new Set([...(nodeIds || [])].filter(Boolean));
+    if(!ids.size){ renderLinks(); return; }
+    connections.forEach(c => {
+        if(ids.has(c.from) || ids.has(c.to)) replaceConnectionEls(c);
+    });
+    if(tempLink) renderLinks();
+}
+function refreshConnectionSelectionClasses(){
+    const connectionMap = new Map((connections || []).map(c => [c.id, c]));
+    linkControlsEl.querySelectorAll('[data-connection-id]').forEach(btn => {
+        const connection = connectionMap.get(btn.dataset.connectionId);
+        if(connection) btn.classList.toggle('visible', isConnectionSelected(connection));
+    });
 }
 function renderKnifeTrail(){
     if(!knifeActive || knifeTrail.length < 2) return;
@@ -12768,7 +13112,7 @@ function refreshSelectionVisuals(){
     nodesEl.querySelectorAll('.node').forEach(el => {
         el.classList.toggle('selected', selected.has(el.dataset.id));
     });
-    renderLinks();
+    refreshConnectionSelectionClasses();
     renderSelectionHub();
     scheduleMinimapRender();
 }
@@ -12846,8 +13190,12 @@ function applyKnifeCut(from, to){
     scheduleSave();
 }
 function setKnifeMode(active){
-    document.body.classList.toggle('canvas-knife', Boolean(active && canvas));
+    const nextActive = Boolean(active && canvas);
+    const hadKnifeVisuals = knifeActive || knifeTrail.length || document.body.classList.contains('canvas-knife');
+    if(nextActive === document.body.classList.contains('canvas-knife') && !hadKnifeVisuals) return;
+    document.body.classList.toggle('canvas-knife', nextActive);
     if(!active){
+        if(!hadKnifeVisuals) return;
         knifeActive = false;
         knifePoint = null;
         knifeTrail = [];
@@ -12897,10 +13245,17 @@ minimap?.addEventListener('mousedown', e => {
     minimapDrag = true;
     centerViewportOnWorldPoint(minimapEventToWorld(e));
     window.onmousemove = e2 => {
-        if(minimapDrag) centerViewportOnWorldPoint(minimapEventToWorld(e2));
+        if(!minimapDrag) return;
+        pendingMinimapDragEvent = e2;
+        scheduleViewportDragFrame();
     };
     window.onmouseup = () => {
+        if(viewportDragFrame){
+            cancelAnimationFrame(viewportDragFrame);
+            applyViewportDragFrame();
+        }
         minimapDrag = false;
+        pendingMinimapDragEvent = null;
         window.onmousemove = null;
         window.onmouseup = null;
         scheduleViewportSave();
@@ -12916,9 +13271,8 @@ function startBoardPan(e){
     dragBoard = {sx:e.clientX, sy:e.clientY, ox:viewport.x, oy:viewport.y};
     document.body.classList.add('canvas-board-pan');
     window.onmousemove = e2 => {
-        viewport.x = dragBoard.ox + e2.clientX - dragBoard.sx;
-        viewport.y = dragBoard.oy + e2.clientY - dragBoard.sy;
-        applyViewport();
+        pendingBoardPanEvent = e2;
+        scheduleViewportDragFrame();
     };
     window.onmouseup = endDrag;
     return true;
@@ -12989,7 +13343,6 @@ board.onwheel = e => {
     viewport.x = e.clientX - rect.left - before.x * viewport.scale;
     viewport.y = e.clientY - rect.top - before.y * viewport.scale;
     applyViewport();
-    renderLinks();
     renderSelectionHub();
     scheduleViewportSave();
 };
