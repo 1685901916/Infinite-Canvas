@@ -1112,6 +1112,8 @@ function serializableCanvasNode(node){
     delete copy._cascadeIdx;
     delete copy._cascadeFailed;
     delete copy._activeLoopCtx;
+    if(Array.isArray(copy.images)) copy.images = cleanOutputMediaItems(copy.images);
+    if(Array.isArray(copy.generatedOutputs)) copy.generatedOutputs = cleanOutputMediaItems(copy.generatedOutputs);
     return copy;
 }
 function serializableCanvasNodes(list=nodes){
@@ -1153,9 +1155,25 @@ function mergeUniqueOutputItems(remoteItems=[], localItems=[]){
         seen.add(key);
         result.push(item);
     };
-    (remoteItems || []).forEach(add);
-    (localItems || []).forEach(add);
+    cleanOutputMediaItems(remoteItems || []).forEach(add);
+    cleanOutputMediaItems(localItems || []).forEach(add);
     return result;
+}
+function mergeCanvasLogs(remoteLogs=[], localLogs=[]){
+    const result = [];
+    const seen = new Set();
+    const add = log => {
+        if(!log) return;
+        const key = log.id || `${log.createdAt || ''}:${log.status || ''}:${(log.outputs || []).map(outputUrlValue).join('|')}:${log.error || ''}`;
+        if(seen.has(key)) return;
+        seen.add(key);
+        result.push(log);
+    };
+    (remoteLogs || []).forEach(add);
+    (localLogs || []).forEach(add);
+    return result
+        .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+        .slice(0, 500);
 }
 function preserveLocalRuntimeNodeState(remoteNodes=[]){
     const localById = new Map((nodes || []).filter(node => node?.id).map(node => [node.id, node]));
@@ -1237,7 +1255,7 @@ async function saveCanvas(){
                 title:data.canvas.title ?? canvas.title,
                 icon:data.canvas.icon ?? canvas.icon,
                 kind:data.canvas.kind ?? canvas.kind,
-                logs:data.canvas.logs || canvas.logs || [],
+                logs:mergeCanvasLogs(data.canvas.logs || [], canvas.logs || []),
                 settings:data.canvas.settings || canvas.settings || {},
                 created_at:data.canvas.created_at ?? canvas.created_at,
                 updated_at:Number(data.canvas.updated_at || data.updated_at || Date.now()),
@@ -1825,8 +1843,9 @@ function applyRemoteCanvasData(remote){
         if(!preserveRuntime) resetCascadeRuntimeState();
         const localViewport = localViewportForCanvas(canvas.id, viewport || remote.viewport || {x:0, y:0, scale:1});
         const localSelectedIds = new Set(selected);
+        const localLogs = canvas.logs || [];
         canvas = remote;
-        canvas.logs = canvas.logs || [];
+        canvas.logs = mergeCanvasLogs(canvas.logs || [], localLogs);
         nodes = preserveLocalRuntimeNodeState(canvas.nodes || []);
         connections = canvas.connections || [];
         viewport = localViewport;
@@ -5582,7 +5601,7 @@ function pendingPreviewSizeFromNode(node){
         if(domSize) return domSize;
     }
     if(node.type === 'output'){
-        const item = [...(node.images || [])].reverse().find(outputUrlValue);
+        const item = [...(node.images || [])].reverse().find(isUsableOutputMediaItem);
         const meta = item && typeof item === 'object' ? item : {};
         return normalizedPendingPreviewSize(meta);
     }
@@ -5962,7 +5981,7 @@ function refreshOutputNodeContent(node){
     if(layout) grid.style.setProperty('--grid-cols', String(Math.max(1, Number(layout.cols || 1))));
     else grid.style.removeProperty('--grid-cols');
     const items = [
-        ...(node.images || []).map(item => ({
+        ...cleanOutputMediaItems(node.images || []).map(item => ({
             key:outputDomKeyForItem(item),
             html:renderOutputMedia(item, !!layout)
         })),
@@ -6084,9 +6103,12 @@ function imageRefsFromNode(node){
     }
     if(node.type === 'output'){
         return (node.images || [])
-            .map(outputUrlValue)
-            .filter(url => url && !isVideoUrl(url) && !isAudioUrl(url))
-            .map((url, i) => ({url, name:outputImageName(url) || `output-${i + 1}.png`, kind:'image'}));
+            .map((item, i) => ({item, i}))
+            .filter(({item}) => outputItemHasKind(item, 'image'))
+            .map(({item, i}) => {
+                const url = outputUrlValue(item);
+                return {url, name:outputImageName(url) || `output-${i + 1}.png`, kind:'image'};
+            });
     }
     if(CANVAS_IMAGE_OUTPUT_TYPES.includes(node.type)) return generatedImageRefs(node).filter(ref => ref.kind === 'image');
     return [];
@@ -7645,7 +7667,8 @@ function llmInputImages(node){
     connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).forEach(n => {
         if(n.type === 'image' && n.url && mediaKindForNode(n) === 'image') urls.push(n.url);
         if(n.type === 'output' && (n.images||[]).length){
-            const last = [...n.images].reverse().map(outputUrlValue).find(url => url && !isVideoUrl(url) && !isAudioUrl(url));
+            const lastItem = [...n.images].reverse().find(item => outputItemHasKind(item, 'image'));
+            const last = outputUrlValue(lastItem);
             if(last) urls.push(last);
         }
         if(n.type === 'group'){
@@ -7659,7 +7682,8 @@ function llmInputVideos(node){
     connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).forEach(n => {
         if(n.type === 'image' && n.url && mediaKindForNode(n) === 'video') urls.push(n.url);
         if(n.type === 'output' && (n.images||[]).length){
-            const last = [...n.images].reverse().map(outputUrlValue).find(url => url && isVideoUrl(url));
+            const lastItem = [...n.images].reverse().find(item => outputItemHasKind(item, 'video'));
+            const last = outputUrlValue(lastItem);
             if(last) urls.push(last);
         }
         if(n.type === 'group'){
@@ -9425,7 +9449,7 @@ function outputNodesForSource(nodeId){
         .filter(n => n?.type === 'output');
 }
 function latestGeneratedOutputItem(node){
-    return [...(node?.generatedOutputs || [])].reverse().find(item => outputUrlValue(item));
+    return [...(node?.generatedOutputs || [])].reverse().find(isUsableOutputMediaItem);
 }
 function outputHasUrl(out, url){
     return Boolean(url && (out?.images || []).some(item => outputUrlValue(item) === url));
@@ -9486,7 +9510,7 @@ function mediaRefsFromNode(node){
             if(!url) return null;
             const kind = mediaKindForOutputItem(item);
             return {url, name:outputImageName(url) || `output-${i + 1}`, kind, nodeId:node.id, outputIndex:i};
-        }).filter(Boolean);
+        }).filter(ref => ref && ref.kind !== 'error');
     }
     if(CANVAS_MEDIA_OUTPUT_TYPES.includes(node.type)) return generatedImageRefs(node);
     return [];
@@ -9496,7 +9520,7 @@ function generatorSources(gen){
         if(n.type === 'output' && (n.images||[]).length){
             // 从 output 节点取最新一张图当作 reference 给下游
             const reversed = [...n.images].map((item, index) => ({item, index})).reverse();
-            const found = reversed.find(entry => outputUrlValue(entry.item));
+            const found = reversed.find(entry => isUsableOutputMediaItem(entry.item));
             if(found){
                 const last = outputUrlValue(found.item);
                 const kind = mediaKindForOutputItem(found.item);
@@ -11300,8 +11324,9 @@ function isVideoUrl(url){
     return /\.(mp4|webm|mov|m4v)$/.test(clean);
 }
 function mediaKindForOutputItem(item){
+    if(isFailedOutputItem(item)) return 'error';
     const explicit = String(item?.kind || item?.mediaKind || '').toLowerCase();
-    if(['image','video','audio','text','file'].includes(explicit)) return explicit;
+    if(['image','video','audio','text','file','error'].includes(explicit)) return explicit;
     const url = outputUrlValue(item);
     if(isVideoUrl(url)) return 'video';
     if(isAudioUrl(url)) return 'audio';
@@ -11317,6 +11342,20 @@ function formatRunDuration(ms){
 function nowMs(){ return Date.now(); }
 function outputUrlValue(item){
     return typeof item === 'string' ? item : item?.url || '';
+}
+function isFailedOutputItem(item){
+    const explicit = String(item?.kind || item?.mediaKind || '').toLowerCase();
+    if(explicit === 'error') return true;
+    return /^failed:\/\//i.test(String(outputUrlValue(item) || ''));
+}
+function outputItemHasKind(item, kind){
+    return Boolean(outputUrlValue(item)) && mediaKindForOutputItem(item) === kind;
+}
+function isUsableOutputMediaItem(item){
+    return Boolean(outputUrlValue(item)) && mediaKindForOutputItem(item) !== 'error';
+}
+function cleanOutputMediaItems(items=[]){
+    return (items || []).filter(isUsableOutputMediaItem);
 }
 function isMissingAssetUrl(url){
     return Boolean(url && missingAssetUrls.has(url));
@@ -11726,6 +11765,9 @@ function renderOutputMedia(item, useGridLayout=false){
     const grid = useGridLayout ? (meta.grid || null) : null;
     const gridStyle = grid ? ` style="grid-row:${Number(grid.row || 0) + 1};grid-column:${Number(grid.col || 0) + 1};aspect-ratio:${Math.max(1, Number(grid.w || 1))}/${Math.max(1, Number(grid.h || 1))}"` : '';
     const timePill = meta.runMs && !meta.viewed ? `<span class="output-time-pill">${formatRunDuration(meta.runMs)}</span>` : '';
+    if(kind === 'error'){
+        return '';
+    }
     if(isMissingAssetUrl(url)){
         return `<div class="output-img-wrap" data-output-url="${safe}" data-missing-url="${safe}"${gridStyle}>${missingAssetHtml(url, true)}${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
     }
@@ -11754,7 +11796,7 @@ function renderOutputGrid(node, pendingHtml=''){
     const layout = outputGridLayout(node);
     const gridClass = layout ? 'output-grid grid-layout' : 'output-grid';
     const style = layout ? ` style="--grid-cols:${Math.max(1, Number(layout.cols || 1))}"` : '';
-    return `<div class="${gridClass}"${style}>${(node.images || []).map(item => renderOutputMedia(item, !!layout)).join('')}${pendingHtml}</div>`;
+    return `<div class="${gridClass}"${style}>${cleanOutputMediaItems(node.images || []).map(item => renderOutputMedia(item, !!layout)).join('')}${pendingHtml}</div>`;
 }
 function outputImageName(url){
     const clean = (url || '').split('?')[0];

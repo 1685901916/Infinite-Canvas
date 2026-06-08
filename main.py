@@ -3028,6 +3028,55 @@ def _node_has_codex_submap_result(node):
         for item in (items if isinstance(items, list) else [])
     )
 
+def canvas_log_output_url(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return str(value.get("url") or value.get("src") or "").strip()
+    return ""
+
+def canvas_log_key(log):
+    if not isinstance(log, dict):
+        return ""
+    log_id = str(log.get("id") or "").strip()
+    if log_id:
+        return f"id:{log_id}"
+    output_key = "|".join(canvas_log_output_url(item) for item in (log.get("outputs") or []))
+    return ":".join([
+        str(log.get("createdAt") or ""),
+        str(log.get("status") or ""),
+        output_key,
+        str(log.get("error") or ""),
+    ])
+
+def canvas_log_created_at(log):
+    if not isinstance(log, dict):
+        return 0
+    try:
+        return int(float(log.get("createdAt") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+def merge_canvas_logs(server_logs, incoming_logs):
+    merged = []
+    seen = set()
+
+    def add(log):
+        if not isinstance(log, dict):
+            return
+        key = canvas_log_key(log) or json.dumps(log, ensure_ascii=False, sort_keys=True)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        merged.append(log)
+
+    for log in server_logs or []:
+        add(log)
+    for log in incoming_logs or []:
+        add(log)
+    merged.sort(key=canvas_log_created_at, reverse=True)
+    return merged[:500]
+
 def merge_protected_canvas_agent_results(server_canvas, incoming_nodes, incoming_connections):
     """Preserve completed Codex/agent submap workflows from stale browser saves."""
     server_nodes = server_canvas.get("nodes") or []
@@ -11467,7 +11516,7 @@ async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
         canvas["viewport"] = payload.viewport
     else:
         canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
-    canvas["logs"] = payload.logs[-500:]
+    canvas["logs"] = merge_canvas_logs(canvas.get("logs") or [], payload.logs or [])
     canvas["settings"] = payload.settings or {}
     save_canvas(canvas)
     await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), payload.client_id)
